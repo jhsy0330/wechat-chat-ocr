@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 
 from .capture import CaptureEngine
+from .content_filter import TextMessageFilter
 from .exporter import export_archive
 from .models import CaptureSettings, Message
 from .ocr import VisionOCR
@@ -43,8 +44,14 @@ class ArchiveWorker(QObject):
             parsed_pages: list[list[Message]] = []
             for index, page in enumerate(pages, 1):
                 self.status.emit(f"OCR 识别第 {index}/{len(pages)} 页")
+                text_filter = TextMessageFilter(page)
                 parsed_pages.append(
-                    parse_page(ocr.recognize(page), self.settings.partner_name)
+                    parse_page(
+                        ocr.recognize(page),
+                        self.settings.partner_name,
+                        text_filter=text_filter.accepts,
+                        system_filter=text_filter.accepts_system,
+                    )
                 )
             current_messages = merge_capture_pages(parsed_pages)
 

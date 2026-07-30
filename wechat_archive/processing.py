@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from collections.abc import Callable
 
 from rapidfuzz.fuzz import ratio
 
@@ -28,14 +29,23 @@ def is_system_line(line: OCRLine) -> bool:
 
 
 def parse_page(
-    lines: Sequence[OCRLine], partner_name: str, minimum_confidence: float = 0.25
+    lines: Sequence[OCRLine],
+    partner_name: str,
+    minimum_confidence: float = 0.25,
+    text_filter: Callable[[OCRLine], bool] | None = None,
+    system_filter: Callable[[OCRLine], bool] | None = None,
 ) -> list[Message]:
     messages: list[Message] = []
     visible_time: str | None = None
     for line in sorted(lines, key=lambda item: (item.y, item.x)):
         if line.confidence < minimum_confidence or not line.text.strip():
             continue
-        if is_system_line(line):
+        system_line = is_system_line(line)
+        if system_line and system_filter is not None and not system_filter(line):
+            continue
+        if not system_line and text_filter is not None and not text_filter(line):
+            continue
+        if system_line:
             speaker = "系统"
             if TIME_PATTERN.search(line.text):
                 visible_time = line.text.strip()
