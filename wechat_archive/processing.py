@@ -22,7 +22,9 @@ def is_system_line(line: OCRLine) -> bool:
     text = line.text.strip()
     center = line.x + line.width / 2
     centered = abs(center - 0.5) <= 0.13
-    return bool(SYSTEM_PATTERN.search(text) or (centered and is_wechat_time_label(text)))
+    return bool(
+        SYSTEM_PATTERN.search(text) or (centered and is_wechat_time_label(text))
+    )
 
 
 def parse_page(
@@ -73,9 +75,14 @@ def parse_page(
             previous = messages[-1]
             previous.text = f"{previous.text}\n{message.text}"
             previous.confidence = min(previous.confidence, message.confidence)
-            previous.height = max(
-                previous.height, message.y + message.height - previous.y
-            )
+            left = min(previous.x, message.x)
+            top = min(previous.y, message.y)
+            right = max(previous.x + previous.width, message.x + message.width)
+            bottom = max(previous.y + previous.height, message.y + message.height)
+            previous.x = left
+            previous.y = top
+            previous.width = right - left
+            previous.height = bottom - top
         else:
             messages.append(message)
     return messages
@@ -114,7 +121,9 @@ def overlap_length(
     return 0
 
 
-def merge_capture_pages(pages_newest_first: Sequence[Sequence[Message]]) -> list[Message]:
+def merge_capture_pages(
+    pages_newest_first: Sequence[Sequence[Message]],
+) -> list[Message]:
     merged: list[Message] = []
     for page in reversed(pages_newest_first):
         overlap = overlap_length(merged, page, allow_short_single=True)

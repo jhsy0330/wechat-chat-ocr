@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -58,7 +59,7 @@ class ArchiveWorker(QObject):
             current_messages = merge_capture_pages(parsed_pages)
 
             store = ArchiveStore(self.data_dir / "archive.sqlite3")
-            filter_cache: dict[Path, TextMessageFilter] = {}
+            filter_cache: OrderedDict[Path, TextMessageFilter] = OrderedDict()
 
             def keep_existing(message: Message, source_path: Path) -> bool:
                 if not source_path.exists():
@@ -67,6 +68,10 @@ class ArchiveWorker(QObject):
                 if content_filter is None:
                     content_filter = TextMessageFilter(source_path)
                     filter_cache[source_path] = content_filter
+                    if len(filter_cache) > 2:
+                        filter_cache.popitem(last=False)
+                else:
+                    filter_cache.move_to_end(source_path)
                 line = OCRLine(
                     text=message.text,
                     confidence=message.confidence,

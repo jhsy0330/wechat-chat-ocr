@@ -90,6 +90,21 @@ class Message:
 
 
 @dataclass(frozen=True)
+class ChatSummary:
+    partner_name: str
+    message_count: int
+    latest_occurred_at: str | None
+
+
+@dataclass(frozen=True)
+class ArchivedMessage:
+    message_id: int
+    partner_name: str
+    message: Message
+    source_path: Path
+
+
+@dataclass(frozen=True)
 class CaptureSettings:
     window: WindowInfo
     region: NormalizedRegion

@@ -9,8 +9,16 @@ from wechat_archive.storage import ArchiveStore
 
 def message(text: str, sequence: int = 0) -> Message:
     return Message(
-        "女朋友", text, 0.9, "page.png", 0.1, 0.1, 0.2, 0.03,
-        visible_time="20:00", sequence=sequence
+        "女朋友",
+        text,
+        0.9,
+        "page.png",
+        0.1,
+        0.1,
+        0.2,
+        0.03,
+        visible_time="20:00",
+        sequence=sequence,
     )
 
 
@@ -49,6 +57,8 @@ def test_existing_image_ocr_can_be_hidden_without_deleting_database(
     store.append_session(
         "女朋友", [message("正常文字"), message("图片文字")], 1, tmp_path / "session-1"
     )
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE messages SET is_visible = NULL")
     visible, _added = store.append_session(
         "女朋友",
         [],
@@ -58,6 +68,22 @@ def test_existing_image_ocr_can_be_hidden_without_deleting_database(
     )
     assert [item.text for item in visible] == ["正常文字"]
     assert len(store.load_messages("女朋友")) == 2
+    assert [record.message.text for record in store.load_chat_messages("女朋友")] == [
+        "正常文字"
+    ]
+    assert store.list_chats()[0].message_count == 1
+
+    def must_not_revalidate(_item: Message, _path: Path) -> bool:
+        raise AssertionError("persisted visibility was revalidated")
+
+    visible, _added = store.append_session(
+        "女朋友",
+        [],
+        0,
+        tmp_path / "session-3",
+        existing_message_filter=must_not_revalidate,
+    )
+    assert [item.text for item in visible] == ["正常文字"]
 
 
 def test_existing_database_adds_occurred_at_column(tmp_path: Path) -> None:
@@ -98,7 +124,5 @@ def test_existing_database_adds_occurred_at_column(tmp_path: Path) -> None:
         )
     ArchiveStore(database)
     with sqlite3.connect(database) as connection:
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(messages)")
-        }
-    assert "occurred_at" in columns
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+    assert {"occurred_at", "is_visible"} <= columns

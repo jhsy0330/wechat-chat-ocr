@@ -29,6 +29,23 @@ def test_parse_sides_and_visible_time() -> None:
     assert messages[1].occurred_at == "2026-07-29T20:15+08:00"
 
 
+def test_multiline_message_uses_union_of_ocr_boxes() -> None:
+    messages = parse_page(
+        [
+            ocr("第一行", 0.12, 0.20, 0.18),
+            OCRLine("第二行更长", 0.95, 0.10, 0.232, 0.32, 0.03, "page.png"),
+        ],
+        "女朋友",
+    )
+
+    assert len(messages) == 1
+    assert messages[0].text == "第一行\n第二行更长"
+    assert messages[0].x == 0.10
+    assert messages[0].y == 0.20
+    assert round(messages[0].width, 3) == 0.32
+    assert round(messages[0].height, 3) == 0.062
+
+
 def test_overlap_uses_speaker_and_text() -> None:
     left = [message("早上好"), message("吃饭了吗"), message("吃了", "我")]
     right = [message("吃饭了吗"), message("吃了", "我"), message("早点休息")]

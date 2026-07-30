@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import tempfile
-from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QDesktopServices,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -21,16 +28,15 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QStyle,
-    QTableWidget,
-    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from . import macos
-from .models import CaptureSettings, Message, NormalizedRegion, WindowInfo
+from .models import CaptureSettings, NormalizedRegion, WindowInfo
+from .viewer import ArchiveViewerPage
 from .worker import ArchiveWorker
 
 
@@ -126,8 +132,7 @@ class RegionDialog(QDialog):
         self.region_size_label.setObjectName("status")
         self.canvas.selection_changed.connect(self._update_region_size)
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Ok
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -155,16 +160,17 @@ class RegionDialog(QDialog):
         )
 
 
-class MainWindow(QMainWindow):
+class CapturePage(QWidget):
+    archive_changed = Signal()
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("微信聊天归档")
-        self.resize(1080, 760)
         self.region = NormalizedRegion()
         self.windows: list[WindowInfo] = []
         self.worker: ArchiveWorker | None = None
         self.thread: QThread | None = None
         self.paused = False
+        self.archive_maintenance = False
         self.last_export: Path | None = None
         self.calibrated_region_size: tuple[int, int] | None = None
         self._build_ui()
@@ -172,14 +178,12 @@ class MainWindow(QMainWindow):
         self.refresh_permissions()
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(18, 16, 18, 16)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        title = QLabel("微信聊天归档")
-        title.setObjectName("title")
+        title = QLabel("获取聊天记录")
+        title.setObjectName("sectionTitle")
         root.addWidget(title)
 
         setup_frame = QFrame()
@@ -192,7 +196,9 @@ class MainWindow(QMainWindow):
         self.window_combo.setMinimumWidth(380)
         window_row.addWidget(self.window_combo, 1)
         refresh_button = QPushButton("刷新")
-        refresh_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        refresh_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
         refresh_button.clicked.connect(self.refresh_windows)
         window_row.addWidget(refresh_button)
         self.calibrate_button = QPushButton("校准区域")
@@ -237,16 +243,22 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         self.start_button = QPushButton("开始记录")
         self.start_button.setObjectName("primary")
-        self.start_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.start_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
         self.start_button.clicked.connect(self.start_capture)
         controls.addWidget(self.start_button)
         self.pause_button = QPushButton("暂停")
-        self.pause_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.pause_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+        )
         self.pause_button.setEnabled(False)
         self.pause_button.clicked.connect(self.toggle_pause)
         controls.addWidget(self.pause_button)
         self.stop_button = QPushButton("停止")
-        self.stop_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.stop_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+        )
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_capture)
         controls.addWidget(self.stop_button)
@@ -266,37 +278,11 @@ class MainWindow(QMainWindow):
         self.status_label.setObjectName("status")
         root.addWidget(self.status_label)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
         self.preview = QLabel("暂无截图")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumWidth(340)
+        self.preview.setMinimumSize(QSize(520, 300))
         self.preview.setObjectName("preview")
-        splitter.addWidget(self.preview)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["序号", "发送方", "内容", "日期时间", "微信显示"]
-        )
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.horizontalHeader().setSectionResizeMode(2, self.table.horizontalHeader().ResizeMode.Stretch)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        splitter.addWidget(self.table)
-        splitter.setSizes([390, 650])
-        root.addWidget(splitter, 1)
-
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #f5f6f7; color: #242629; }
-            QLabel#title { font-size: 22px; font-weight: 650; }
-            QFrame#settings { background: white; border: 1px solid #dfe2e5; border-radius: 6px; }
-            QPushButton { min-height: 28px; padding: 2px 10px; }
-            QPushButton#primary { background: #168f4e; color: white; border: 1px solid #11753f; border-radius: 4px; }
-            QPushButton#primary:disabled { background: #aeb8b2; border-color: #aeb8b2; }
-            QLabel#status { color: #5f666d; }
-            QLabel#preview { background: #202124; color: #c7cbd0; border: 1px solid #d8dbde; }
-            QTableWidget { background: white; border: 1px solid #d8dbde; gridline-color: #eceeef; }
-            """
-        )
+        root.addWidget(self.preview, 1)
 
     def selected_window(self) -> WindowInfo | None:
         index = self.window_combo.currentIndex()
@@ -306,7 +292,9 @@ class MainWindow(QMainWindow):
         self.windows = macos.list_wechat_windows()
         self.window_combo.clear()
         self.window_combo.addItems([window.label for window in self.windows])
-        available = bool(self.windows) and self.worker is None
+        available = (
+            bool(self.windows) and self.worker is None and not self.archive_maintenance
+        )
         self.start_button.setEnabled(available)
         self.calibrate_button.setEnabled(available)
         if not self.windows:
@@ -317,9 +305,7 @@ class MainWindow(QMainWindow):
         capture = macos.screen_capture_granted()
         access_text = "已授权" if accessibility else "未授权"
         capture_text = "已授权" if capture else "未授权"
-        self.permission_label.setText(
-            f"辅助功能：{access_text}    屏幕录制：{capture_text}"
-        )
+        self.permission_label.setText(f"辅助功能：{access_text}    屏幕录制：{capture_text}")
 
     def request_permissions(self) -> None:
         macos.request_accessibility()
@@ -351,9 +337,7 @@ class MainWindow(QMainWindow):
                         f"{width} x {height} px（建议滚动 {low}-{high} px）"
                     )
                     self._show_preview(screenshot)
-                    self.status_label.setText(
-                        f"聊天区域已校准：{width} x {height} px"
-                    )
+                    self.status_label.setText(f"聊天区域已校准：{width} x {height} px")
         except RuntimeError as error:
             QMessageBox.critical(self, "校准失败", str(error))
 
@@ -380,7 +364,6 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.status_label.setText)
         self.worker.page_captured.connect(self.on_page_captured)
-        self.worker.messages_ready.connect(self.show_messages)
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.finished.connect(self.thread.quit)
@@ -393,7 +376,6 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
         self.progress.setRange(0, 0)
-        self.table.setRowCount(0)
         self.last_export = None
         self.open_export_button.setEnabled(False)
 
@@ -404,11 +386,15 @@ class MainWindow(QMainWindow):
         if self.paused:
             self.worker.pause()
             self.pause_button.setText("继续")
-            self.pause_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.pause_button.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+            )
         else:
             self.worker.resume()
             self.pause_button.setText("暂停")
-            self.pause_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.pause_button.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+            )
 
     def stop_capture(self) -> None:
         if self.worker is not None:
@@ -429,24 +415,11 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def show_messages(self, messages: list[Message]) -> None:
-        self.table.setRowCount(len(messages))
-        for row, message in enumerate(messages):
-            values = (
-                str(message.sequence),
-                message.speaker,
-                message.text,
-                _display_datetime(message.occurred_at),
-                message.visible_time or "",
-            )
-            for column, value in enumerate(values):
-                self.table.setItem(row, column, QTableWidgetItem(value))
-        self.table.resizeColumnsToContents()
-
-    def on_finished(self, _messages: list[Message], export_path: str, added: int) -> None:
+    def on_finished(self, _messages: object, export_path: str, added: int) -> None:
         self.last_export = Path(export_path)
         self.open_export_button.setEnabled(True)
         self.status_label.setText(f"完成，本次新增 {added} 条识别记录")
+        self.archive_changed.emit()
 
     def on_failed(self, message: str) -> None:
         self.status_label.setText("任务失败")
@@ -471,23 +444,115 @@ class MainWindow(QMainWindow):
         if self.last_export is not None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_export)))
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def request_close(self) -> bool:
         if self.worker is not None:
             self.worker.stop()
-            event.ignore()
+            self.status_label.setText("正在安全停止，停止后可关闭窗口")
+            return False
+        return True
+
+    def set_archive_maintenance(self, active: bool) -> None:
+        if self.archive_maintenance == active:
             return
-        event.accept()
+        self.archive_maintenance = active
+        if active and self.worker is None:
+            self.start_button.setEnabled(False)
+            self.calibrate_button.setEnabled(False)
+            self.status_label.setText("正在后台整理旧档案，完成后可开始采集")
+        elif self.worker is None:
+            self.status_label.setText("等待开始")
+            self.refresh_windows()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("微信聊天归档")
+        self.setMinimumSize(QSize(1020, 680))
+        self.resize(1280, 820)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        title = QLabel("微信聊天归档")
+        title.setObjectName("title")
+        root.addWidget(title)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.capture_page = CapturePage()
+        self.viewer_page = ArchiveViewerPage(DATA_DIR / "archive.sqlite3")
+        self.capture_tab_index = self.tabs.addTab(self.capture_page, "获取聊天记录")
+        self.viewer_tab_index = self.tabs.addTab(self.viewer_page, "查看聊天记录")
+        self.capture_page.archive_changed.connect(self.viewer_page.refresh_archive)
+        self.viewer_page.maintenance_changed.connect(
+            self.capture_page.set_archive_maintenance
+        )
+        self.capture_page.set_archive_maintenance(
+            self.viewer_page.maintenance_running()
+        )
+        root.addWidget(self.tabs, 1)
+
+        self.setStyleSheet(
+            """
+            QMainWindow { background: #f5f6f7; color: #242629; }
+            QLabel#title { font-size: 22px; font-weight: 650; }
+            QLabel#sectionTitle { font-size: 18px; font-weight: 650; }
+            QLabel#panelTitle { font-size: 14px; font-weight: 650; }
+            QFrame#settings, QFrame#archivePanel {
+                background: white;
+                border: 1px solid #dfe2e5;
+                border-radius: 6px;
+            }
+            QFrame#archivePanel QLabel, QFrame#archivePanel QPushButton,
+            QFrame#archivePanel QLineEdit, QFrame#archivePanel QComboBox,
+            QFrame#archivePanel QListWidget, QFrame#archivePanel QTableWidget {
+                border-radius: 0;
+            }
+            QTabWidget::pane { border: 0; }
+            QTabBar::tab { min-width: 130px; padding: 9px 16px; }
+            QTabBar::tab:selected { color: #11753f; font-weight: 650; }
+            QPushButton { min-height: 28px; padding: 2px 10px; }
+            QPushButton#primary {
+                background: #168f4e;
+                color: white;
+                border: 1px solid #11753f;
+                border-radius: 4px;
+            }
+            QPushButton#primary:disabled {
+                background: #aeb8b2;
+                border-color: #aeb8b2;
+            }
+            QLabel#status { color: #5f666d; }
+            QLabel#preview, QWidget#screenshotViewer {
+                background: #202124;
+                color: #c7cbd0;
+                border: 1px solid #d8dbde;
+            }
+            QTableWidget, QListWidget {
+                background: white;
+                border: 1px solid #d8dbde;
+                gridline-color: #eceeef;
+            }
+            QTableWidget::item:selected, QListWidget::item:selected {
+                background: #dcefe4;
+                color: #202124;
+            }
+            """
+        )
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        capture_ready = self.capture_page.request_close()
+        viewer_ready = self.viewer_page.request_close()
+        if capture_ready and viewer_ready:
+            event.accept()
+        else:
+            event.ignore()
 
 
 def configure_application(application: QApplication) -> None:
     application.setApplicationName("微信聊天归档")
     application.setOrganizationName("Local Archive")
-
-
-def _display_datetime(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return value
