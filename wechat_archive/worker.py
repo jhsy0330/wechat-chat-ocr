@@ -8,9 +8,9 @@ from PySide6.QtCore import QObject, Signal, Slot
 from .capture import CaptureEngine
 from .content_filter import TextMessageFilter
 from .exporter import export_archive
-from .models import CaptureSettings, Message
+from .models import CaptureSettings, Message, OCRLine
 from .ocr import VisionOCR
-from .processing import merge_capture_pages, parse_page
+from .processing import is_system_line, merge_capture_pages, parse_page
 from .storage import ArchiveStore
 
 
@@ -56,11 +56,34 @@ class ArchiveWorker(QObject):
             current_messages = merge_capture_pages(parsed_pages)
 
             store = ArchiveStore(self.data_dir / "archive.sqlite3")
+            filter_cache: dict[Path, TextMessageFilter] = {}
+
+            def keep_existing(message: Message, source_path: Path) -> bool:
+                if not source_path.exists():
+                    return True
+                content_filter = filter_cache.get(source_path)
+                if content_filter is None:
+                    content_filter = TextMessageFilter(source_path)
+                    filter_cache[source_path] = content_filter
+                line = OCRLine(
+                    text=message.text,
+                    confidence=message.confidence,
+                    x=message.x,
+                    y=message.y,
+                    width=message.width,
+                    height=message.height,
+                    source=message.source,
+                )
+                if is_system_line(line):
+                    return content_filter.accepts_system(line)
+                return content_filter.accepts(line)
+
             all_messages, added = store.append_session(
                 self.settings.partner_name,
                 current_messages,
                 len(pages),
                 pages[0].parent,
+                existing_message_filter=keep_existing,
             )
             export_name = datetime.now().strftime("chat-%Y%m%d-%H%M%S")
             output = self.data_dir / "exports" / export_name

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from .models import Message
 from .processing import overlap_length
@@ -88,15 +89,30 @@ class ArchiveStore:
         messages: Sequence[Message],
         page_count: int,
         session_dir: Path,
+        existing_message_filter: Callable[[Message, Path], bool] | None = None,
     ) -> tuple[list[Message], int]:
         with self._connect() as connection:
             chat_id = self._chat_id(connection, partner_name)
             existing_rows = connection.execute(
-                "SELECT * FROM messages WHERE chat_id = ? ORDER BY sequence",
+                """
+                SELECT m.*, s.session_dir FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE m.chat_id = ? ORDER BY m.sequence
+                """,
                 (chat_id,),
             ).fetchall()
-            existing = [self._row_to_message(row) for row in existing_rows]
-            overlap = overlap_length(existing, messages)
+            all_existing = [self._row_to_message(row) for row in existing_rows]
+            if existing_message_filter is None:
+                visible_existing = all_existing
+            else:
+                visible_existing = [
+                    message
+                    for message, row in zip(all_existing, existing_rows, strict=True)
+                    if existing_message_filter(
+                        message, Path(str(row["session_dir"])) / message.source
+                    )
+                ]
+            overlap = overlap_length(visible_existing, messages)
             additions = list(messages[overlap:])
 
             cursor = connection.execute(
@@ -112,7 +128,9 @@ class ArchiveStore:
                 ),
             )
             session_id = int(cursor.lastrowid)
-            next_sequence = len(existing) + 1
+            next_sequence = max(
+                (message.sequence for message in all_existing), default=0
+            ) + 1
             for offset, message in enumerate(additions):
                 message.sequence = next_sequence + offset
                 connection.execute(
@@ -138,7 +156,7 @@ class ArchiveStore:
                         message.kind,
                     ),
                 )
-        return existing + additions, len(additions)
+        return visible_existing + additions, len(additions)
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:
