@@ -89,6 +89,11 @@ class Message:
     date_source: str = "unresolved"
     is_deleted: bool = False
     edited_at: str | None = None
+    fingerprint: str | None = None
+    previous_fingerprint: str | None = None
+    next_fingerprint: str | None = None
+    review_status: str = "pending"
+    reviewed_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -121,3 +126,46 @@ class CaptureSettings:
     unchanged_limit: int = 3
     session_dir: Path = Path("data/captures")
     direction: str = "up"
+
+
+@dataclass(frozen=True)
+class CapturePageInfo:
+    page_number: int
+    source_path: Path
+    sha256: str
+    perceptual_hash: str
+    ocr_status: str
+    ocr_json: str | None = None
+
+
+@dataclass(frozen=True)
+class CaptureSessionSummary:
+    session_id: int
+    partner_name: str
+    status: str
+    direction: str
+    page_count: int
+    ocr_page_count: int
+    session_dir: Path
+    settings: dict[str, Any]
+    started_at: str
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    record: ArchivedMessage
+    reasons: tuple[str, ...]
+    status: str
+    reviewed_at: str | None
+
+
+@dataclass(frozen=True)
+class CaptureConflict:
+    conflict_id: int
+    partner_name: str
+    session_id: int
+    kind: str
+    details: dict[str, Any]
+    status: str
+    created_at: str

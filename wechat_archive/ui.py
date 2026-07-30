@@ -36,8 +36,14 @@ from PySide6.QtWidgets import (
 )
 
 from . import macos
-from .models import CaptureSettings, NormalizedRegion, WindowInfo
-from .viewer import ArchiveViewerPage
+from .models import (
+    CaptureSessionSummary,
+    CaptureSettings,
+    NormalizedRegion,
+    WindowInfo,
+)
+from .storage import ArchiveStore
+from .viewer import ArchiveViewerPage, ReviewQueuePage
 from .worker import ArchiveWorker
 
 
@@ -175,9 +181,11 @@ class CapturePage(QWidget):
         self.archive_maintenance = False
         self.last_export: Path | None = None
         self.calibrated_region_size: tuple[int, int] | None = None
+        self.resumable_sessions: list[CaptureSessionSummary] = []
         self._build_ui()
         self.refresh_windows()
         self.refresh_permissions()
+        self.refresh_resumable_sessions()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -247,6 +255,18 @@ class CapturePage(QWidget):
         settings_row.addStretch()
         form.addRow("采集设置", settings_row)
         setup_layout.addLayout(form)
+        resume_row = QHBoxLayout()
+        resume_row.addWidget(QLabel("未完成任务"))
+        self.resume_combo = QComboBox()
+        self.resume_combo.setMinimumWidth(420)
+        resume_row.addWidget(self.resume_combo, 1)
+        self.resume_button = QPushButton("继续任务")
+        self.resume_button.clicked.connect(self.resume_capture)
+        resume_row.addWidget(self.resume_button)
+        self.abandon_button = QPushButton("放弃任务")
+        self.abandon_button.clicked.connect(self.abandon_capture)
+        resume_row.addWidget(self.abandon_button)
+        setup_layout.addLayout(resume_row)
         root.addWidget(setup_frame)
 
         controls = QHBoxLayout()
@@ -368,26 +388,133 @@ class CapturePage(QWidget):
             session_dir=self.data_dir / "captures",
             direction=str(self.direction_combo.currentData()),
         )
+        self._start_worker(settings)
+
+    def _start_worker(
+        self, settings: CaptureSettings, resume_session_id: int | None = None
+    ) -> None:
         self.thread = QThread(self)
-        self.worker = ArchiveWorker(settings, self.data_dir)
+        self.worker = ArchiveWorker(
+            settings, self.data_dir, resume_session_id=resume_session_id
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.status_label.setText)
         self.worker.page_captured.connect(self.on_page_captured)
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
+        self.worker.interrupted.connect(self.on_interrupted)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.interrupted.connect(self.thread.quit)
         self.thread.finished.connect(self._thread_finished)
         self.thread.start()
 
         self.start_button.setEnabled(False)
         self.calibrate_button.setEnabled(False)
+        self.resume_button.setEnabled(False)
+        self.abandon_button.setEnabled(False)
         self.pause_button.setEnabled(True)
         self.stop_button.setEnabled(True)
         self.progress.setRange(0, 0)
         self.last_export = None
         self.open_export_button.setEnabled(False)
+
+    def refresh_resumable_sessions(self) -> None:
+        selected_id = (
+            self.resume_combo.currentData() if hasattr(self, "resume_combo") else None
+        )
+        self.resumable_sessions = ArchiveStore(
+            self.data_dir / "archive.sqlite3"
+        ).list_resumable_sessions()
+        self.resume_combo.clear()
+        selected_index = -1
+        for index, session in enumerate(self.resumable_sessions):
+            label = (
+                f"{session.partner_name} · {session.page_count} 页 · "
+                f"{session.status} · {session.started_at[:16]}"
+            )
+            self.resume_combo.addItem(label, session.session_id)
+            if session.session_id == selected_id:
+                selected_index = index
+        if selected_index >= 0:
+            self.resume_combo.setCurrentIndex(selected_index)
+        available = bool(self.resumable_sessions) and self.worker is None
+        self.resume_button.setEnabled(available)
+        self.abandon_button.setEnabled(available)
+        if not self.resumable_sessions:
+            self.resume_combo.addItem("没有未完成任务", None)
+
+    def _selected_resumable_session(self) -> CaptureSessionSummary | None:
+        session_id = self.resume_combo.currentData()
+        return next(
+            (
+                session
+                for session in self.resumable_sessions
+                if session.session_id == session_id
+            ),
+            None,
+        )
+
+    def resume_capture(self) -> None:
+        session = self._selected_resumable_session()
+        window = self.selected_window()
+        if session is None or window is None:
+            return
+        if not macos.accessibility_granted() or not macos.screen_capture_granted():
+            self.request_permissions()
+            return
+        region_value = session.settings.get("region", {})
+        region = NormalizedRegion(
+            float(region_value.get("x", self.region.x)),
+            float(region_value.get("y", self.region.y)),
+            float(region_value.get("width", self.region.width)),
+            float(region_value.get("height", self.region.height)),
+        )
+        settings = CaptureSettings(
+            window=window,
+            region=region,
+            partner_name=session.partner_name,
+            max_pages=int(session.settings.get("max_pages", 50)),
+            scroll_pixels=int(session.settings.get("scroll_pixels", 650)),
+            stability_interval=float(session.settings.get("stability_interval", 0.18)),
+            stability_timeout=float(session.settings.get("stability_timeout", 3.0)),
+            unchanged_limit=int(session.settings.get("unchanged_limit", 3)),
+            session_dir=self.data_dir / "captures",
+            direction=session.direction,
+        )
+        pages = ArchiveStore(self.data_dir / "archive.sqlite3").load_capture_pages(
+            session.session_id
+        )
+        if pages:
+            self._show_preview(pages[-1].source_path)
+        QMessageBox.information(
+            self,
+            "继续未完成任务",
+            "请先将微信停留在右侧显示的最后一页附近。程序会验证页面指纹，匹配后才会继续滚动。",
+        )
+        self.partner_input.setText(session.partner_name)
+        self.region = region
+        self.direction_combo.setCurrentIndex(
+            max(0, self.direction_combo.findData(session.direction))
+        )
+        self._start_worker(settings, session.session_id)
+
+    def abandon_capture(self) -> None:
+        session = self._selected_resumable_session()
+        if session is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "放弃未完成任务",
+            "只会结束该会话，已经保存的截图和 OCR 检查点不会删除。是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        ArchiveStore(self.data_dir / "archive.sqlite3").abandon_session(
+            session.session_id
+        )
+        self.refresh_resumable_sessions()
 
     def toggle_pause(self) -> None:
         if self.worker is None:
@@ -425,10 +552,23 @@ class CapturePage(QWidget):
             )
         )
 
-    def on_finished(self, _messages: object, export_path: str, added: int) -> None:
+    def on_finished(
+        self,
+        _messages: object,
+        export_path: str,
+        added: int,
+        conflict_id: int,
+    ) -> None:
         self.last_export = Path(export_path)
         self.open_export_button.setEnabled(True)
-        self.status_label.setText(f"完成，本次新增 {added} 条识别记录")
+        if conflict_id:
+            self.status_label.setText("采集完成，但顺序存在冲突，请到待复核页面处理")
+        else:
+            self.status_label.setText(f"完成，本次新增 {added} 条识别记录")
+        self.archive_changed.emit()
+
+    def on_interrupted(self, _session_id: int) -> None:
+        self.status_label.setText("任务已中断，可从未完成任务继续")
         self.archive_changed.emit()
 
     def on_failed(self, message: str) -> None:
@@ -449,6 +589,7 @@ class CapturePage(QWidget):
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
         self.refresh_windows()
+        self.refresh_resumable_sessions()
 
     def open_export(self) -> None:
         if self.last_export is not None:
@@ -475,9 +616,7 @@ class CapturePage(QWidget):
 
     def _direction_changed(self) -> None:
         direction = str(self.direction_combo.currentData())
-        self.scroll_direction_label.setText(
-            "每次向上滚动" if direction == "up" else "每次向下滚动"
-        )
+        self.scroll_direction_label.setText("每次向上滚动" if direction == "up" else "每次向下滚动")
 
     def set_data_dir(self, data_dir: Path) -> None:
         if self.worker is not None:
@@ -486,6 +625,7 @@ class CapturePage(QWidget):
         self.last_export = None
         self.open_export_button.setEnabled(False)
         self.status_label.setText(f"归档目录：{data_dir}")
+        self.refresh_resumable_sessions()
 
 
 class MainWindow(QMainWindow):
@@ -530,9 +670,16 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.capture_page = CapturePage(self.archive_root)
         self.viewer_page = ArchiveViewerPage(self.archive_root / "archive.sqlite3")
+        self.review_page = ReviewQueuePage(self.archive_root / "archive.sqlite3")
         self.capture_tab_index = self.tabs.addTab(self.capture_page, "获取聊天记录")
         self.viewer_tab_index = self.tabs.addTab(self.viewer_page, "查看聊天记录")
+        self.review_tab_index = self.tabs.addTab(self.review_page, "待复核")
         self.capture_page.archive_changed.connect(self.viewer_page.refresh_archive)
+        self.capture_page.archive_changed.connect(self.review_page.refresh)
+        self.review_page.archive_changed.connect(self.viewer_page.refresh_archive)
+        self.review_page.archive_changed.connect(
+            self.capture_page.refresh_resumable_sessions
+        )
         self.viewer_page.maintenance_changed.connect(
             self.capture_page.set_archive_maintenance
         )
@@ -606,6 +753,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.viewer_page.set_database_path(archive_root / "archive.sqlite3")
+            self.review_page.set_database_path(archive_root / "archive.sqlite3")
             self.capture_page.set_data_dir(archive_root)
         except (OSError, RuntimeError) as error:
             QMessageBox.warning(self, "无法切换归档目录", str(error))

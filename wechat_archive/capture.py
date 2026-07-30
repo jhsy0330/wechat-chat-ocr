@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageStat
 
 from . import macos
+from .fingerprints import hash_distance, image_dhash
 from .models import CaptureSettings
 
 
@@ -17,10 +18,15 @@ StatusCallback = Callable[[str], None]
 PageCallback = Callable[[int, Path], None]
 
 
+class ResumeAnchorMismatch(RuntimeError):
+    pass
+
+
 class CaptureEngine:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._pause = threading.Event()
+        self.was_stopped = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -36,41 +42,57 @@ class CaptureEngine:
         settings: CaptureSettings,
         on_status: StatusCallback = lambda _message: None,
         on_page: PageCallback = lambda _number, _path: None,
+        session_dir: Path | None = None,
+        existing_pages: list[Path] | None = None,
     ) -> list[Path]:
         if settings.direction not in {"up", "down"}:
             raise ValueError("采集方向必须是 up 或 down")
         self._stop.clear()
+        self.was_stopped = False
         session_name = datetime.now().strftime("%Y%m%d-%H%M%S")
-        session_dir = settings.session_dir / session_name
+        session_dir = session_dir or settings.session_dir / session_name
         working_dir = session_dir / ".working"
         working_dir.mkdir(parents=True, exist_ok=True)
-        pages: list[Path] = []
+        pages: list[Path] = list(existing_pages or [])
 
         if not macos.activate_window(settings.window):
             raise RuntimeError("无法激活微信窗口，请确认微信仍在运行")
         time.sleep(0.5)
 
-        on_status("正在截取当前页")
-        first = self._capture_region(settings, working_dir / "initial.png")
-        page_path = session_dir / "page-001.png"
-        shutil.copy2(first, page_path)
-        pages.append(page_path)
-        on_page(1, page_path)
-        previous_image = page_path
+        if pages:
+            on_status("正在验证断点页面")
+            anchor = self._capture_region(settings, working_dir / "resume-anchor.png")
+            distance = hash_distance(image_dhash(anchor), image_dhash(pages[-1]))
+            if distance > 10 or not self._same_content(
+                anchor, pages[-1], threshold=12.0
+            ):
+                raise ResumeAnchorMismatch("当前微信页面与断点最后一页不匹配。请根据最后一页截图将聊天移动到相近位置后重试。")
+            previous_image = pages[-1]
+        else:
+            on_status("正在截取当前页")
+            first = self._capture_region(settings, working_dir / "initial.png")
+            page_path = session_dir / "page-001.png"
+            shutil.copy2(first, page_path)
+            pages.append(page_path)
+            on_page(1, page_path)
+            previous_image = page_path
         unchanged = 0
+        next_page_number = len(pages) + 1
 
-        for page_number in range(2, settings.max_pages + 1):
+        while next_page_number <= settings.max_pages:
             if self._should_stop():
+                self.was_stopped = True
                 on_status("任务已停止")
                 break
             self._wait_if_paused(on_status)
             if self._should_stop():
+                self.was_stopped = True
                 break
             if not macos.is_frontmost_wechat(settings.window):
                 raise RuntimeError("微信失去焦点，已停止以避免滚动其他窗口")
 
             direction_text = "向上" if settings.direction == "up" else "向下"
-            on_status(f"{direction_text}滚动，准备第 {page_number} 页")
+            on_status(f"{direction_text}滚动，准备第 {next_page_number} 页")
             scroll_delta = (
                 settings.scroll_pixels
                 if settings.direction == "up"
@@ -80,7 +102,9 @@ class CaptureEngine:
                 settings.region.screen_point(settings.window), scroll_delta
             )
             time.sleep(0.25)
-            stable_image = self._wait_for_stability(settings, working_dir, page_number)
+            stable_image = self._wait_for_stability(
+                settings, working_dir, next_page_number
+            )
             if self._same_content(previous_image, stable_image):
                 unchanged += 1
                 on_status(f"页面没有明显变化（{unchanged}/{settings.unchanged_limit}）")
@@ -91,11 +115,16 @@ class CaptureEngine:
                 continue
 
             unchanged = 0
-            page_path = session_dir / f"page-{page_number:03d}.png"
+            source_number = next_page_number
+            page_path = session_dir / f"page-{source_number:03d}.png"
+            while page_path.exists():
+                source_number += 1
+                page_path = session_dir / f"page-{source_number:03d}.png"
             shutil.copy2(stable_image, page_path)
             pages.append(page_path)
             previous_image = page_path
-            on_page(len(pages), page_path)
+            on_page(next_page_number, page_path)
+            next_page_number += 1
 
         shutil.rmtree(working_dir, ignore_errors=True)
         return pages
@@ -104,7 +133,9 @@ class CaptureEngine:
         full_path = destination.with_name(destination.stem + "-full.png")
         macos.capture_window(settings.window.window_id, full_path)
         with Image.open(full_path) as image:
-            image.crop(settings.region.pixel_box(image)).convert("RGB").save(destination)
+            image.crop(settings.region.pixel_box(image)).convert("RGB").save(
+                destination
+            )
         full_path.unlink(missing_ok=True)
         return destination
 

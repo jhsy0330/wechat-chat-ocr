@@ -43,10 +43,13 @@ from PySide6.QtWidgets import (
     QWidget,
     QTextEdit,
     QGroupBox,
+    QInputDialog,
+    QSpinBox,
+    QTabWidget,
 )
 
 from .exporter import DEFAULT_EXPORT_FIELDS, EXPORT_FIELDS, export_records
-from .models import ArchivedMessage, ChatSummary, Message
+from .models import ArchivedMessage, ChatSummary, Message, ReviewRecord
 from .storage import ArchiveStore
 from .visibility import ArchiveVisibilityScanner
 
@@ -71,7 +74,9 @@ class EditMessageDialog(QDialog):
         occurred_time = ""
         if message.occurred_at:
             try:
-                occurred_time = datetime.fromisoformat(message.occurred_at).strftime("%H:%M")
+                occurred_time = datetime.fromisoformat(message.occurred_at).strftime(
+                    "%H:%M"
+                )
             except ValueError:
                 pass
         self.time_edit = QLineEdit(occurred_time)
@@ -97,6 +102,115 @@ class EditMessageDialog(QDialog):
             self.date_edit.text().strip() or None,
             self.time_edit.text().strip() or None,
         )
+
+
+class RevisionHistoryDialog(QDialog):
+    def __init__(
+        self,
+        store: ArchiveStore,
+        record: ArchivedMessage,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.record = record
+        self.versions: list[dict[str, object]] = []
+        self.restored = False
+        self.setWindowTitle("修订历史")
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(f"{record.partner_name} · 消息 #{record.message_id}"))
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["时间", "动作", "变化字段"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.currentCellChanged.connect(self._show_version)
+        root.addWidget(self.table, 1)
+        self.detail = QTextEdit()
+        self.detail.setReadOnly(True)
+        self.detail.setMinimumHeight(180)
+        root.addWidget(self.detail)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.restore_button = buttons.addButton(
+            "恢复到这个版本", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.restore_button.clicked.connect(self._restore_version)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._load_versions()
+        self.resize(760, 620)
+
+    def _load_versions(self) -> None:
+        revisions = self.store.load_message_revisions(self.record.message_id)
+        initial = (
+            dict(revisions[0]["before"])
+            if revisions
+            else {
+                "text": self.record.message.text,
+                "speaker": self.record.message.speaker,
+                "occurred_date": self.record.message.occurred_date,
+                "occurred_at": self.record.message.occurred_at,
+                "date_source": self.record.message.date_source,
+                "is_deleted": self.record.message.is_deleted,
+                "edited_at": self.record.message.edited_at,
+            }
+        )
+        initial["text"] = self.record.message.original_text or initial.get("text", "")
+        self.versions = [initial] + [dict(item["after"]) for item in revisions]
+        rows = [("初始识别", "OCR 初始版本", "text")] + [
+            (
+                str(item["created_at"]),
+                _revision_action_label(str(item["action"])),
+                "、".join(_changed_fields(item["before"], item["after"])),
+            )
+            for item in revisions
+        ]
+        self.table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+        if rows:
+            self.table.setCurrentCell(len(rows) - 1, 0)
+
+    def _show_version(
+        self, row: int, _column: int, _previous_row: int, _previous_column: int
+    ) -> None:
+        if not 0 <= row < len(self.versions):
+            return
+        snapshot = self.versions[row]
+        lines = [
+            f"文字：{snapshot.get('text') or ''}",
+            f"发送人：{snapshot.get('speaker') or ''}",
+            f"日期：{snapshot.get('occurred_date') or ''}",
+            f"时间：{snapshot.get('occurred_at') or ''}",
+            f"日期来源：{snapshot.get('date_source') or ''}",
+            f"删除状态：{'已删除' if snapshot.get('is_deleted') else '正常'}",
+        ]
+        self.detail.setPlainText("\n".join(lines))
+
+    def _restore_version(self) -> None:
+        row = self.table.currentRow()
+        if not 0 <= row < len(self.versions):
+            return
+        answer = QMessageBox.question(
+            self,
+            "恢复历史版本",
+            "当前内容不会从历史中删除，恢复操作会新增一条修订记录。是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.store.restore_message_version(self.record.message_id, self.versions[row])
+        self.restored = True
+        self.accept()
 
 
 class ExportDialog(QDialog):
@@ -138,7 +252,9 @@ class ExportDialog(QDialog):
 
         format_box = QGroupBox("文件格式")
         format_layout = QHBoxLayout(format_box)
-        saved_formats = set(str(self.settings.value("export/formats", "json,xlsx")).split(","))
+        saved_formats = set(
+            str(self.settings.value("export/formats", "json,xlsx")).split(",")
+        )
         self.format_checks: dict[str, QCheckBox] = {}
         for key, label in self.FORMATS:
             check = QCheckBox(label)
@@ -162,9 +278,7 @@ class ExportDialog(QDialog):
         field_layout = QFormLayout(field_box)
         saved_fields = set(
             str(
-                self.settings.value(
-                    "export/fields", ",".join(DEFAULT_EXPORT_FIELDS)
-                )
+                self.settings.value("export/fields", ",".join(DEFAULT_EXPORT_FIELDS))
             ).split(",")
         )
         self.field_checks: dict[str, QCheckBox] = {}
@@ -176,7 +290,8 @@ class ExportDialog(QDialog):
             field_layout.addRow(check)
         root.addWidget(field_box)
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save
         )
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("导出")
         buttons.accepted.connect(self._validate)
@@ -188,7 +303,9 @@ class ExportDialog(QDialog):
         preset = self.preset_combo.currentData()
         if preset == "custom":
             return
-        fields = set(DEFAULT_EXPORT_FIELDS) if preset == "concise" else set(EXPORT_FIELDS)
+        fields = (
+            set(DEFAULT_EXPORT_FIELDS) if preset == "concise" else set(EXPORT_FIELDS)
+        )
         for key, check in self.field_checks.items():
             check.blockSignals(True)
             check.setChecked(key in fields)
@@ -202,9 +319,7 @@ class ExportDialog(QDialog):
 
     def _validate(self) -> None:
         if not self.formats() or not self.fields():
-            QMessageBox.warning(
-                self, "无法导出", "请至少选择一种格式和一个字段。"
-            )
+            QMessageBox.warning(self, "无法导出", "请至少选择一种格式和一个字段。")
             return
         self.settings.setValue("export/formats", ",".join(sorted(self.formats())))
         self.settings.setValue("export/fields", ",".join(self.fields()))
@@ -392,12 +507,8 @@ class ArchiveViewerPage(QWidget):
         self.chat_list = QListWidget()
         self.chat_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.chat_list.currentItemChanged.connect(self._chat_selected)
-        self.chat_list.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self.chat_list.customContextMenuRequested.connect(
-            self._show_chat_context_menu
-        )
+        self.chat_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chat_list.customContextMenuRequested.connect(self._show_chat_context_menu)
         layout.addWidget(self.chat_list, 1)
         self.chat_count_label = QLabel("0 个联系人")
         self.chat_count_label.setObjectName("status")
@@ -469,9 +580,7 @@ class ArchiveViewerPage(QWidget):
         )
         self.message_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.message_table.currentCellChanged.connect(self._message_selected)
-        self.message_table.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
+        self.message_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.message_table.customContextMenuRequested.connect(
             self._show_message_context_menu
         )
@@ -615,8 +724,10 @@ class ArchiveViewerPage(QWidget):
         query = self.message_search.text().strip()
         speaker = self.speaker_filter.currentData()
         self.total_messages = self.store.count_chat_messages(
-            partner_name, query=query, speaker=speaker,
-            include_deleted=self.include_deleted
+            partner_name,
+            query=query,
+            speaker=speaker,
+            include_deleted=self.include_deleted,
         )
         page_count = (self.total_messages + PAGE_SIZE - 1) // PAGE_SIZE
         if page_count:
@@ -713,10 +824,13 @@ class ArchiveViewerPage(QWidget):
     ) -> QMenu:
         menu = QMenu(self)
         edit_action = QAction("修改记录", menu)
-        edit_action.triggered.connect(
-            lambda _checked=False: self._edit_record(record)
-        )
+        edit_action.triggered.connect(lambda _checked=False: self._edit_record(record))
         menu.addAction(edit_action)
+        history_action = QAction("查看修订历史", menu)
+        history_action.triggered.connect(
+            lambda _checked=False: self._show_revision_history(record)
+        )
+        menu.addAction(history_action)
 
         screenshot_action = QAction("查看对应截图", menu)
         screenshot_action.triggered.connect(
@@ -734,9 +848,7 @@ class ArchiveViewerPage(QWidget):
         deleted = record.message.is_deleted
         state_action = QAction("恢复记录" if deleted else "删除记录", menu)
         state_action.triggered.connect(
-            lambda _checked=False: self._set_records_deleted(
-                [record], not deleted
-            )
+            lambda _checked=False: self._set_records_deleted([record], not deleted)
         )
         menu.addAction(state_action)
 
@@ -748,9 +860,7 @@ class ArchiveViewerPage(QWidget):
                 item for item in selected_records if item.message.is_deleted
             ]
             if active_records:
-                delete_selected = QAction(
-                    f"删除所选记录（{len(active_records)} 条）", menu
-                )
+                delete_selected = QAction(f"删除所选记录（{len(active_records)} 条）", menu)
                 delete_selected.triggered.connect(
                     lambda _checked=False: self._set_records_deleted(
                         active_records, True
@@ -758,9 +868,7 @@ class ArchiveViewerPage(QWidget):
                 )
                 menu.addAction(delete_selected)
             if deleted_records:
-                restore_selected = QAction(
-                    f"恢复所选记录（{len(deleted_records)} 条）", menu
-                )
+                restore_selected = QAction(f"恢复所选记录（{len(deleted_records)} 条）", menu)
                 restore_selected.triggered.connect(
                     lambda _checked=False: self._set_records_deleted(
                         deleted_records, False
@@ -777,9 +885,7 @@ class ArchiveViewerPage(QWidget):
         )
         menu.addAction(export_current)
         if len(selected_records) > 1:
-            export_selected = QAction(
-                f"导出所选记录（{len(selected_records)} 条）", menu
-            )
+            export_selected = QAction(f"导出所选记录（{len(selected_records)} 条）", menu)
             export_selected.triggered.connect(
                 lambda _checked=False: self._export_records(
                     forced_scope="selected",
@@ -859,6 +965,12 @@ class ArchiveViewerPage(QWidget):
             return
         self.refresh_archive()
 
+    def _show_revision_history(self, record: ArchivedMessage) -> None:
+        dialog = RevisionHistoryDialog(self.store, record, self)
+        dialog.exec()
+        if dialog.restored:
+            self.refresh_archive()
+
     def _toggle_current_deleted(self) -> None:
         if self.current_record is None:
             return
@@ -875,15 +987,9 @@ class ArchiveViewerPage(QWidget):
         verb = "删除" if deleted else "恢复"
         if deleted:
             if len(records) == 1:
-                message = (
-                    "这条记录将被隐藏，但仍可通过“显示已删除”恢复。"
-                    "是否继续？"
-                )
+                message = "这条记录将被隐藏，但仍可通过“显示已删除”恢复。" "是否继续？"
             else:
-                message = (
-                    f"所选 {len(records)} 条记录将被隐藏，之后仍可恢复。"
-                    "是否继续？"
-                )
+                message = f"所选 {len(records)} 条记录将被隐藏，之后仍可恢复。" "是否继续？"
             answer = QMessageBox.question(
                 self,
                 "删除聊天记录",
@@ -899,7 +1005,9 @@ class ArchiveViewerPage(QWidget):
 
     def _selected_records(self) -> list[ArchivedMessage]:
         rows = sorted({index.row() for index in self.message_table.selectedIndexes()})
-        return [self.page_records[row] for row in rows if 0 <= row < len(self.page_records)]
+        return [
+            self.page_records[row] for row in rows if 0 <= row < len(self.page_records)
+        ]
 
     def _export_records(
         self,
@@ -936,12 +1044,12 @@ class ArchiveViewerPage(QWidget):
             ),
         )
         if not records:
-            QMessageBox.information(
-                self, "没有可导出内容", "当前范围没有聊天记录。"
-            )
+            QMessageBox.information(self, "没有可导出内容", "当前范围没有聊天记录。")
             return
-        output = self.database_path.parent / "exports" / datetime.now().strftime(
-            "chat-%Y%m%d-%H%M%S-%f"
+        output = (
+            self.database_path.parent
+            / "exports"
+            / datetime.now().strftime("chat-%Y%m%d-%H%M%S-%f")
         )
         try:
             outputs = export_records(
@@ -1052,6 +1160,371 @@ class ArchiveViewerPage(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.source_path)))
 
 
+class ReviewQueuePage(QWidget):
+    archive_changed = Signal()
+
+    REASONS = {
+        "low_confidence": "低置信度",
+        "missing_date": "日期空白",
+        "uncertain_speaker": "发送人存疑",
+        "suspected_duplicate": "疑似重复",
+        "missing_screenshot": "截图缺失",
+        "invalid_coordinates": "坐标异常",
+    }
+
+    def __init__(self, database_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.database_path = database_path
+        self.store = ArchiveStore(database_path)
+        self.settings = QSettings()
+        self.review_records: list[ReviewRecord] = []
+        self.conflicts = []
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        toolbar = QHBoxLayout()
+        title = QLabel("待复核")
+        title.setObjectName("sectionTitle")
+        toolbar.addWidget(title)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("status")
+        toolbar.addWidget(self.count_label)
+        toolbar.addStretch()
+        refresh_button = QPushButton("刷新")
+        refresh_button.clicked.connect(self.refresh)
+        toolbar.addWidget(refresh_button)
+        root.addLayout(toolbar)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_message_review_tab(), "异常消息")
+        self.tabs.addTab(self._build_conflict_tab(), "采集冲突")
+        root.addWidget(self.tabs, 1)
+
+    def _build_message_review_tab(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("状态"))
+        self.review_status = QComboBox()
+        self.review_status.addItem("待复核", "pending")
+        self.review_status.addItem("已确认", "confirmed")
+        self.review_status.addItem("暂不处理", "deferred")
+        self.review_status.addItem("全部", "all")
+        self.review_status.currentIndexChanged.connect(self.refresh_reviews)
+        filters.addWidget(self.review_status)
+        filters.addWidget(QLabel("问题"))
+        self.reason_filter = QComboBox()
+        self.reason_filter.addItem("全部问题", None)
+        for key, label in self.REASONS.items():
+            self.reason_filter.addItem(label, key)
+        self.reason_filter.currentIndexChanged.connect(self.refresh_reviews)
+        filters.addWidget(self.reason_filter)
+        filters.addWidget(QLabel("低置信度阈值"))
+        self.confidence_threshold = QSpinBox()
+        self.confidence_threshold.setRange(25, 99)
+        self.confidence_threshold.setSuffix(" %")
+        self.confidence_threshold.setValue(
+            int(self.settings.value("review/confidence_threshold", 75))
+        )
+        self.confidence_threshold.valueChanged.connect(
+            self._confidence_threshold_changed
+        )
+        filters.addWidget(self.confidence_threshold)
+        filters.addStretch()
+        root.addLayout(filters)
+
+        actions = QHBoxLayout()
+        for label, status in (
+            ("确认无误", "confirmed"),
+            ("暂不处理", "deferred"),
+            ("重新待复核", "pending"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, value=status: self._set_selected_review_status(
+                    value
+                )
+            )
+            actions.addWidget(button)
+        self.review_edit_button = QPushButton("修改当前记录")
+        self.review_edit_button.clicked.connect(self._edit_review_record)
+        actions.addWidget(self.review_edit_button)
+        self.review_delete_button = QPushButton("删除所选")
+        self.review_delete_button.clicked.connect(self._delete_review_records)
+        actions.addWidget(self.review_delete_button)
+        actions.addStretch()
+        root.addLayout(actions)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.review_table = QTableWidget(0, 7)
+        self.review_table.setHorizontalHeaderLabels(
+            ["联系人", "问题", "置信度", "日期", "发送人", "内容", "状态"]
+        )
+        self.review_table.verticalHeader().setVisible(False)
+        self.review_table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.Stretch
+        )
+        for column in (0, 1, 2, 3, 4, 6):
+            self.review_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.review_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.review_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.review_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.review_table.currentCellChanged.connect(self._review_current_changed)
+        splitter.addWidget(self.review_table)
+        self.review_screenshot = ScreenshotViewer()
+        splitter.addWidget(self.review_screenshot)
+        splitter.setSizes([760, 440])
+        root.addWidget(splitter, 1)
+        return page
+
+    def _build_conflict_tab(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        actions = QHBoxLayout()
+        ignore_button = QPushButton("忽略本次")
+        ignore_button.clicked.connect(lambda: self._resolve_conflict("ignore"))
+        actions.addWidget(ignore_button)
+        append_button = QPushButton("作为新消息追加")
+        append_button.clicked.connect(lambda: self._resolve_conflict("append"))
+        actions.addWidget(append_button)
+        insert_button = QPushButton("按序号插入")
+        insert_button.clicked.connect(lambda: self._resolve_conflict("insert"))
+        actions.addWidget(insert_button)
+        self.merge_conflict_button = QPushButton("按建议锚点合并")
+        self.merge_conflict_button.clicked.connect(
+            lambda: self._resolve_conflict("merge")
+        )
+        actions.addWidget(self.merge_conflict_button)
+        actions.addStretch()
+        root.addLayout(actions)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.conflict_table = QTableWidget(0, 5)
+        self.conflict_table.setHorizontalHeaderLabels(["联系人", "类型", "暂存消息", "时间", "状态"])
+        self.conflict_table.verticalHeader().setVisible(False)
+        self.conflict_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.conflict_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.conflict_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.conflict_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        self.conflict_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.conflict_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.conflict_table.currentCellChanged.connect(self._conflict_current_changed)
+        splitter.addWidget(self.conflict_table)
+        self.conflict_detail = QTextEdit()
+        self.conflict_detail.setReadOnly(True)
+        splitter.addWidget(self.conflict_detail)
+        splitter.setSizes([620, 580])
+        root.addWidget(splitter, 1)
+        return page
+
+    def refresh(self) -> None:
+        self.store = ArchiveStore(self.database_path)
+        self.refresh_reviews()
+        self.refresh_conflicts()
+        self.count_label.setText(
+            f"{len(self.review_records)} 条异常消息 · {len(self.conflicts)} 个采集冲突"
+        )
+
+    def refresh_reviews(self, _value=None) -> None:
+        if not hasattr(self, "review_table"):
+            return
+        self.review_records = self.store.list_review_records(
+            confidence_threshold=self.confidence_threshold.value() / 100,
+            status=str(self.review_status.currentData()),
+            reason_filter=self.reason_filter.currentData(),
+        )
+        self.review_table.setRowCount(len(self.review_records))
+        for row, review in enumerate(self.review_records):
+            message = review.record.message
+            values = (
+                review.record.partner_name,
+                "、".join(self.REASONS[reason] for reason in review.reasons),
+                f"{message.confidence * 100:.0f}%",
+                message.occurred_date or "",
+                message.speaker,
+                message.text.replace("\n", " "),
+                _review_status_label(review.status),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, review)
+                self.review_table.setItem(row, column, item)
+        if self.review_records:
+            self.review_table.setCurrentCell(0, 0)
+        else:
+            self.review_screenshot.clear("当前没有匹配的异常消息")
+        self._update_count_label()
+
+    def refresh_conflicts(self) -> None:
+        self.conflicts = self.store.list_capture_conflicts(status="pending")
+        self.conflict_table.setRowCount(len(self.conflicts))
+        for row, conflict in enumerate(self.conflicts):
+            values = (
+                conflict.partner_name,
+                "顺序锚点不唯一" if conflict.kind == "ambiguous_anchor" else "未找到顺序锚点",
+                str(len(conflict.details.get("messages", []))),
+                conflict.created_at,
+                "待处理",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, conflict)
+                self.conflict_table.setItem(row, column, item)
+        if self.conflicts:
+            self.conflict_table.setCurrentCell(0, 0)
+        else:
+            self.conflict_detail.setPlainText("当前没有采集冲突")
+        self._update_count_label()
+
+    def _selected_review_records(self) -> list[ReviewRecord]:
+        rows = sorted({index.row() for index in self.review_table.selectedIndexes()})
+        return [
+            self.review_records[row]
+            for row in rows
+            if 0 <= row < len(self.review_records)
+        ]
+
+    def _set_selected_review_status(self, status: str) -> None:
+        records = self._selected_review_records()
+        if not records:
+            return
+        self.store.set_review_status(
+            [review.record.message_id for review in records], status
+        )
+        self.refresh()
+
+    def _edit_review_record(self) -> None:
+        records = self._selected_review_records()
+        if not records:
+            return
+        record = records[0].record
+        dialog = EditMessageDialog(record, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            text, speaker, occurred_date, occurred_time = dialog.values()
+            self.store.update_message(
+                record.message_id,
+                text=text,
+                speaker=speaker,
+                occurred_date=occurred_date,
+                occurred_time=occurred_time,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "修改失败", str(error))
+            return
+        self.archive_changed.emit()
+        self.refresh()
+
+    def _delete_review_records(self) -> None:
+        records = self._selected_review_records()
+        if not records:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除复核记录",
+            f"将软删除所选 {len(records)} 条消息，之后仍可恢复。是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.store.set_messages_deleted(
+            [review.record.message_id for review in records], True
+        )
+        self.archive_changed.emit()
+        self.refresh()
+
+    def _review_current_changed(
+        self, row: int, _column: int, _previous_row: int, _previous_column: int
+    ) -> None:
+        if 0 <= row < len(self.review_records):
+            self.review_screenshot.show_record(self.review_records[row].record)
+
+    def _conflict_current_changed(
+        self, row: int, _column: int, _previous_row: int, _previous_column: int
+    ) -> None:
+        if not 0 <= row < len(self.conflicts):
+            return
+        conflict = self.conflicts[row]
+        messages = conflict.details.get("messages", [])
+        lines = [
+            f"联系人：{conflict.partner_name}",
+            f"类型：{conflict.kind}",
+            f"暂存消息：{len(messages)} 条",
+            "",
+        ]
+        for payload in messages[:50]:
+            lines.append(
+                f"[{payload.get('occurred_date') or '无日期'}] "
+                f"{payload.get('speaker') or ''}：{payload.get('text') or ''}"
+            )
+        if len(messages) > 50:
+            lines.append(f"……其余 {len(messages) - 50} 条未显示")
+        self.conflict_detail.setPlainText("\n".join(lines))
+        self.merge_conflict_button.setEnabled(
+            bool(conflict.details.get("suggested_alignment"))
+        )
+
+    def _resolve_conflict(self, action: str) -> None:
+        row = self.conflict_table.currentRow()
+        if not 0 <= row < len(self.conflicts):
+            return
+        conflict = self.conflicts[row]
+        insert_sequence = None
+        if action == "insert":
+            insert_sequence, accepted = QInputDialog.getInt(
+                self, "插入位置", "从第几条消息之前插入", 1, 1, 10_000_000
+            )
+            if not accepted:
+                return
+        try:
+            self.store.resolve_capture_conflict(
+                conflict.conflict_id,
+                action,
+                insert_sequence=insert_sequence,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "处理失败", str(error))
+            return
+        self.archive_changed.emit()
+        self.refresh()
+
+    def _confidence_threshold_changed(self, value: int) -> None:
+        self.settings.setValue("review/confidence_threshold", value)
+        self.refresh_reviews()
+
+    def _update_count_label(self) -> None:
+        if hasattr(self, "count_label"):
+            self.count_label.setText(
+                f"{len(self.review_records)} 条异常消息 · " f"{len(self.conflicts)} 个采集冲突"
+            )
+
+    def set_database_path(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.store = ArchiveStore(database_path)
+        self.refresh()
+
+
 def _display_datetime(value: str | None) -> str:
     if not value:
         return ""
@@ -1080,3 +1553,33 @@ def _message_status(message: Message) -> str:
     elif message.date_source == "manual":
         states.append("日期手动")
     return " · ".join(states)
+
+
+def _revision_action_label(action: str) -> str:
+    return {
+        "edit": "修改",
+        "delete": "删除",
+        "restore": "恢复",
+        "revert": "版本恢复",
+    }.get(action, action)
+
+
+def _review_status_label(status: str) -> str:
+    return {
+        "pending": "待复核",
+        "confirmed": "已确认",
+        "deferred": "暂不处理",
+    }.get(status, status)
+
+
+def _changed_fields(before: dict[str, object], after: dict[str, object]) -> list[str]:
+    labels = {
+        "text": "文字",
+        "speaker": "发送人",
+        "occurred_date": "日期",
+        "occurred_at": "时间",
+        "date_source": "日期来源",
+        "is_deleted": "删除状态",
+        "edited_at": "修改时间",
+    }
+    return [labels.get(key, key) for key in labels if before.get(key) != after.get(key)]
