@@ -4,8 +4,20 @@ from datetime import datetime
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QThread, QUrl, Signal, Slot, QSettings
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap
+from PySide6.QtCore import (
+    QObject,
+    QRectF,
+    QSize,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    Slot,
+    QSettings,
+    QPoint,
+    QItemSelectionModel,
+)
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -22,6 +34,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QMessageBox,
+    QMenu,
     QSplitter,
     QStyle,
     QTableWidget,
@@ -94,7 +107,14 @@ class ExportDialog(QDialog):
         ("html", "HTML"),
     )
 
-    def __init__(self, selected_count: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        selected_count: int,
+        parent: QWidget | None = None,
+        *,
+        initial_scope: str = "filtered",
+        fixed_scope: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("导出聊天记录")
         self.settings = QSettings()
@@ -107,9 +127,12 @@ class ExportDialog(QDialog):
         self.scope_combo.addItem(f"已选择记录（{selected_count} 条）", "selected")
         if selected_count == 0:
             self.scope_combo.model().item(2).setEnabled(False)
-        saved_scope = str(self.settings.value("export/scope", "filtered"))
-        index = self.scope_combo.findData(saved_scope)
-        self.scope_combo.setCurrentIndex(index if index >= 0 else 1)
+        requested_scope = fixed_scope or initial_scope
+        index = self.scope_combo.findData(requested_scope)
+        if index < 0 or (requested_scope == "selected" and selected_count == 0):
+            index = self.scope_combo.findData("filtered")
+        self.scope_combo.setCurrentIndex(index)
+        self.scope_combo.setEnabled(fixed_scope is None)
         scope_layout.addWidget(self.scope_combo)
         root.addWidget(scope_box)
 
@@ -183,7 +206,6 @@ class ExportDialog(QDialog):
                 self, "无法导出", "请至少选择一种格式和一个字段。"
             )
             return
-        self.settings.setValue("export/scope", self.scope())
         self.settings.setValue("export/formats", ",".join(sorted(self.formats())))
         self.settings.setValue("export/fields", ",".join(self.fields()))
         self.accept()
@@ -370,6 +392,12 @@ class ArchiveViewerPage(QWidget):
         self.chat_list = QListWidget()
         self.chat_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.chat_list.currentItemChanged.connect(self._chat_selected)
+        self.chat_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.chat_list.customContextMenuRequested.connect(
+            self._show_chat_context_menu
+        )
         layout.addWidget(self.chat_list, 1)
         self.chat_count_label = QLabel("0 个联系人")
         self.chat_count_label.setObjectName("status")
@@ -441,6 +469,12 @@ class ArchiveViewerPage(QWidget):
         )
         self.message_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.message_table.currentCellChanged.connect(self._message_selected)
+        self.message_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.message_table.customContextMenuRequested.connect(
+            self._show_message_context_menu
+        )
         layout.addWidget(self.message_table, 1)
 
         pagination = QHBoxLayout()
@@ -527,6 +561,28 @@ class ArchiveViewerPage(QWidget):
             return None
         value = item.data(Qt.ItemDataRole.UserRole)
         return str(value) if value else None
+
+    def _show_chat_context_menu(self, position: QPoint) -> None:
+        item = self.chat_list.itemAt(position)
+        if item is None:
+            return
+        self.chat_list.setCurrentItem(item)
+        partner_name = str(item.data(Qt.ItemDataRole.UserRole))
+        menu = self._build_chat_context_menu(partner_name)
+        menu.exec(self.chat_list.viewport().mapToGlobal(position))
+
+    def _build_chat_context_menu(self, partner_name: str) -> QMenu:
+        menu = QMenu(self)
+        export_action = QAction("导出该联系人的全部聊天记录", menu)
+        export_action.triggered.connect(
+            lambda _checked=False: self._export_records(
+                forced_scope="all",
+                partner_name=partner_name,
+                include_deleted=False,
+            )
+        )
+        menu.addAction(export_action)
+        return menu
 
     def _chat_selected(
         self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
@@ -629,6 +685,110 @@ class ArchiveViewerPage(QWidget):
         if isinstance(record, ArchivedMessage):
             self._show_record(record)
 
+    def _show_message_context_menu(self, position: QPoint) -> None:
+        index = self.message_table.indexAt(position)
+        if not index.isValid():
+            return
+        row = index.row()
+        selected_rows = {
+            selected.row() for selected in self.message_table.selectedIndexes()
+        }
+        if row not in selected_rows:
+            self.message_table.clearSelection()
+            self.message_table.selectRow(row)
+        self.message_table.setCurrentCell(
+            row,
+            0,
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+        record = self.page_records[row]
+        self._show_record(record)
+        menu = self._build_message_context_menu(record, self._selected_records())
+        menu.exec(self.message_table.viewport().mapToGlobal(position))
+
+    def _build_message_context_menu(
+        self,
+        record: ArchivedMessage,
+        selected_records: list[ArchivedMessage],
+    ) -> QMenu:
+        menu = QMenu(self)
+        edit_action = QAction("修改记录", menu)
+        edit_action.triggered.connect(
+            lambda _checked=False: self._edit_record(record)
+        )
+        menu.addAction(edit_action)
+
+        screenshot_action = QAction("查看对应截图", menu)
+        screenshot_action.triggered.connect(
+            lambda _checked=False: self._show_record(record)
+        )
+        menu.addAction(screenshot_action)
+        open_action = QAction("打开原始截图", menu)
+        open_action.setEnabled(record.source_path.is_file())
+        open_action.triggered.connect(
+            lambda _checked=False: self._open_record_source(record)
+        )
+        menu.addAction(open_action)
+        menu.addSeparator()
+
+        deleted = record.message.is_deleted
+        state_action = QAction("恢复记录" if deleted else "删除记录", menu)
+        state_action.triggered.connect(
+            lambda _checked=False: self._set_records_deleted(
+                [record], not deleted
+            )
+        )
+        menu.addAction(state_action)
+
+        if len(selected_records) > 1:
+            active_records = [
+                item for item in selected_records if not item.message.is_deleted
+            ]
+            deleted_records = [
+                item for item in selected_records if item.message.is_deleted
+            ]
+            if active_records:
+                delete_selected = QAction(
+                    f"删除所选记录（{len(active_records)} 条）", menu
+                )
+                delete_selected.triggered.connect(
+                    lambda _checked=False: self._set_records_deleted(
+                        active_records, True
+                    )
+                )
+                menu.addAction(delete_selected)
+            if deleted_records:
+                restore_selected = QAction(
+                    f"恢复所选记录（{len(deleted_records)} 条）", menu
+                )
+                restore_selected.triggered.connect(
+                    lambda _checked=False: self._set_records_deleted(
+                        deleted_records, False
+                    )
+                )
+                menu.addAction(restore_selected)
+        menu.addSeparator()
+
+        export_current = QAction("导出当前记录", menu)
+        export_current.triggered.connect(
+            lambda _checked=False: self._export_records(
+                forced_scope="selected", selected_records=[record]
+            )
+        )
+        menu.addAction(export_current)
+        if len(selected_records) > 1:
+            export_selected = QAction(
+                f"导出所选记录（{len(selected_records)} 条）", menu
+            )
+            export_selected.triggered.connect(
+                lambda _checked=False: self._export_records(
+                    forced_scope="selected",
+                    selected_records=selected_records,
+                )
+            )
+            menu.addAction(export_selected)
+        return menu
+
     def _show_record(self, record: ArchivedMessage) -> None:
         self.current_record = record
         available = self.screenshot_viewer.show_record(record)
@@ -678,13 +838,17 @@ class ArchiveViewerPage(QWidget):
     def _edit_current(self) -> None:
         if self.current_record is None:
             return
-        dialog = EditMessageDialog(self.current_record, self)
+        self._edit_record(self.current_record)
+
+    def _edit_record(self, record: ArchivedMessage) -> None:
+        self._show_record(record)
+        dialog = EditMessageDialog(record, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
             text, speaker, occurred_date, occurred_time = dialog.values()
             self.store.update_message(
-                self.current_record.message_id,
+                record.message_id,
                 text=text,
                 speaker=speaker,
                 occurred_date=occurred_date,
@@ -698,52 +862,86 @@ class ArchiveViewerPage(QWidget):
     def _toggle_current_deleted(self) -> None:
         if self.current_record is None:
             return
-        deleted = not self.current_record.message.is_deleted
+        self._set_records_deleted(
+            [self.current_record], not self.current_record.message.is_deleted
+        )
+
+    def _set_records_deleted(
+        self, records: list[ArchivedMessage], deleted: bool
+    ) -> None:
+        records = [item for item in records if item.message.is_deleted != deleted]
+        if not records:
+            return
         verb = "删除" if deleted else "恢复"
         if deleted:
+            if len(records) == 1:
+                message = (
+                    "这条记录将被隐藏，但仍可通过“显示已删除”恢复。"
+                    "是否继续？"
+                )
+            else:
+                message = (
+                    f"所选 {len(records)} 条记录将被隐藏，之后仍可恢复。"
+                    "是否继续？"
+                )
             answer = QMessageBox.question(
                 self,
                 "删除聊天记录",
-                "这条记录将被隐藏，但仍可通过“显示已删除”恢复。是否继续？",
+                message,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self.store.set_message_deleted(self.current_record.message_id, deleted)
-        self.archive_status.setText(f"记录已{verb}")
+        self.store.set_messages_deleted(
+            [record.message_id for record in records], deleted
+        )
+        self.archive_status.setText(f"已{verb} {len(records)} 条记录")
         self.refresh_archive()
 
     def _selected_records(self) -> list[ArchivedMessage]:
         rows = sorted({index.row() for index in self.message_table.selectedIndexes()})
         return [self.page_records[row] for row in rows if 0 <= row < len(self.page_records)]
 
-    def _export_records(self) -> None:
-        partner_name = self._selected_partner_name()
+    def _export_records(
+        self,
+        _checked: bool = False,
+        *,
+        forced_scope: str | None = None,
+        partner_name: str | None = None,
+        selected_records: list[ArchivedMessage] | None = None,
+        include_deleted: bool | None = None,
+    ) -> None:
+        partner_name = partner_name or self._selected_partner_name()
         if partner_name is None:
             return
-        selected = self._selected_records()
-        dialog = ExportDialog(len(selected), self)
+        selected = (
+            list(selected_records)
+            if selected_records is not None
+            else self._selected_records()
+        )
+        dialog = ExportDialog(
+            len(selected),
+            self,
+            initial_scope=forced_scope or "filtered",
+            fixed_scope=forced_scope,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         scope = dialog.scope()
-        if scope == "selected":
-            records = selected
-        else:
-            query = self.message_search.text().strip() if scope == "filtered" else ""
-            speaker = self.speaker_filter.currentData() if scope == "filtered" else None
-            records = self.store.load_chat_messages(
-                partner_name,
-                query=query,
-                speaker=speaker,
-                newest_first=False,
-                include_deleted=self.include_deleted,
-            )
+        records = self._records_for_export(
+            partner_name,
+            scope,
+            selected,
+            include_deleted=(
+                self.include_deleted if include_deleted is None else include_deleted
+            ),
+        )
         if not records:
             QMessageBox.information(
                 self, "没有可导出内容", "当前范围没有聊天记录。"
             )
             return
         output = self.database_path.parent / "exports" / datetime.now().strftime(
-            "chat-%Y%m%d-%H%M%S"
+            "chat-%Y%m%d-%H%M%S-%f"
         )
         try:
             outputs = export_records(
@@ -760,6 +958,26 @@ class ArchiveViewerPage(QWidget):
         paths = "\n".join(str(path) for path in outputs.values())
         QMessageBox.information(self, "导出完成", paths)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
+
+    def _records_for_export(
+        self,
+        partner_name: str,
+        scope: str,
+        selected_records: list[ArchivedMessage],
+        *,
+        include_deleted: bool,
+    ) -> list[ArchivedMessage]:
+        if scope == "selected":
+            return selected_records
+        query = self.message_search.text().strip() if scope == "filtered" else ""
+        speaker = self.speaker_filter.currentData() if scope == "filtered" else None
+        return self.store.load_chat_messages(
+            partner_name,
+            query=query,
+            speaker=speaker,
+            newest_first=False,
+            include_deleted=include_deleted,
+        )
 
     def set_database_path(self, database_path: Path) -> None:
         if database_path == self.database_path:
@@ -825,13 +1043,13 @@ class ArchiveViewerPage(QWidget):
         return True
 
     def _open_current_source(self) -> None:
-        if (
-            self.current_record is not None
-            and self.current_record.source_path.is_file()
-        ):
-            QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(self.current_record.source_path))
-            )
+        if self.current_record is not None:
+            self._open_record_source(self.current_record)
+
+    @staticmethod
+    def _open_record_source(record: ArchivedMessage) -> None:
+        if record.source_path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.source_path)))
 
 
 def _display_datetime(value: str | None) -> str:

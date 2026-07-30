@@ -4,6 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
 from openpyxl import load_workbook
 
 from wechat_archive.exporter import export_records
@@ -68,6 +69,35 @@ def test_edit_delete_restore_and_revision_history(tmp_path: Path) -> None:
         "delete",
         "restore",
     ]
+
+
+def test_batch_soft_delete_is_atomic_and_records_each_revision(tmp_path: Path) -> None:
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    store.append_session(
+        "小明",
+        [message("第一条"), message("第二条")],
+        1,
+        tmp_path / "captures" / "one",
+    )
+    records = store.load_chat_messages("小明")
+    message_ids = [record.message_id for record in records]
+
+    store.set_messages_deleted(message_ids, True)
+
+    assert store.count_chat_messages("小明") == 0
+    assert store.count_chat_messages("小明", include_deleted=True) == 2
+    for message_id in message_ids:
+        revisions = store.load_message_revisions(message_id)
+        assert [revision["action"] for revision in revisions] == ["delete"]
+
+    store.set_messages_deleted(message_ids, True)
+    for message_id in message_ids:
+        assert len(store.load_message_revisions(message_id)) == 1
+
+    store.set_messages_deleted(message_ids, False)
+    with pytest.raises(ValueError, match="聊天记录不存在"):
+        store.set_messages_deleted([message_ids[0], 999999], True)
+    assert store.count_chat_messages("小明") == 2
 
 
 def test_legacy_schema_and_session_path_are_migrated(tmp_path: Path) -> None:
@@ -163,4 +193,3 @@ def test_selectable_export_fields_and_four_formats(tmp_path: Path) -> None:
     assert "data:image" not in outputs["html"].read_text(encoding="utf-8")
     workbook = load_workbook(outputs["xlsx"])
     assert [cell.value for cell in workbook.active[1]] == ["日期", "发送人", "修正后文字", "截图路径"]
-

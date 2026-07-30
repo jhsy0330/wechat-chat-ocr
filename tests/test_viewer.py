@@ -151,3 +151,124 @@ def test_export_dialog_disables_selected_scope_when_nothing_selected() -> None:
     assert not selected_item.isEnabled()
     assert dialog.formats()
     assert dialog.fields()
+
+
+def test_export_dialog_scope_is_set_by_current_entry_point() -> None:
+    application()
+    dialog = ExportDialog(3, initial_scope="filtered")
+    assert dialog.scope() == "filtered"
+    assert dialog.scope_combo.isEnabled()
+
+    contact_dialog = ExportDialog(0, initial_scope="all", fixed_scope="all")
+    assert contact_dialog.scope() == "all"
+    assert not contact_dialog.scope_combo.isEnabled()
+
+    selected_dialog = ExportDialog(
+        3, initial_scope="selected", fixed_scope="selected"
+    )
+    assert selected_dialog.scope() == "selected"
+    assert not selected_dialog.scope_combo.isEnabled()
+
+
+def test_contact_context_menu_exports_all_visible_records(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    store.append_session(
+        "联系人",
+        [make_message("文字", "page.png", "2026-07-30T20:00+08:00")],
+        1,
+        tmp_path / "captures" / "one",
+    )
+    page = ArchiveViewerPage(store.path)
+    assert (
+        page.chat_list.contextMenuPolicy()
+        == Qt.ContextMenuPolicy.CustomContextMenu
+    )
+    assert (
+        page.message_table.contextMenuPolicy()
+        == Qt.ContextMenuPolicy.CustomContextMenu
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        page, "_export_records", lambda **kwargs: calls.append(kwargs)
+    )
+
+    menu = page._build_chat_context_menu("联系人")
+    assert [action.text() for action in menu.actions()] == [
+        "导出该联系人的全部聊天记录"
+    ]
+    menu.actions()[0].trigger()
+    assert calls == [
+        {
+            "forced_scope": "all",
+            "partner_name": "联系人",
+            "include_deleted": False,
+        }
+    ]
+
+
+def test_message_context_menu_has_current_and_multi_select_actions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    store.append_session(
+        "联系人",
+        [
+            make_message("第一条", "one.png", "2026-07-30T20:00+08:00"),
+            make_message("第二条", "two.png", "2026-07-30T20:01+08:00"),
+        ],
+        1,
+        tmp_path / "captures" / "one",
+    )
+    page = ArchiveViewerPage(store.path)
+    records = page.page_records
+    deleted_calls: list[tuple[list[int], bool]] = []
+    monkeypatch.setattr(
+        page,
+        "_set_records_deleted",
+        lambda selected, deleted: deleted_calls.append(
+            ([record.message_id for record in selected], deleted)
+        ),
+    )
+
+    menu = page._build_message_context_menu(records[0], records)
+    labels = [action.text() for action in menu.actions() if not action.isSeparator()]
+    assert labels == [
+        "修改记录",
+        "查看对应截图",
+        "打开原始截图",
+        "删除记录",
+        "删除所选记录（2 条）",
+        "导出当前记录",
+        "导出所选记录（2 条）",
+    ]
+    next(action for action in menu.actions() if action.text().startswith("删除所选")).trigger()
+    assert deleted_calls == [([record.message_id for record in records], True)]
+
+
+def test_export_all_ignores_message_filters_and_pagination(tmp_path: Path) -> None:
+    application()
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    store.append_session(
+        "联系人",
+        [
+            make_message("苹果", "one.png", "2026-07-30T20:00+08:00"),
+            make_message("香蕉", "two.png", "2026-07-30T20:01+08:00"),
+        ],
+        1,
+        tmp_path / "captures" / "one",
+    )
+    page = ArchiveViewerPage(store.path)
+    page.message_search.setText("苹果")
+
+    filtered = page._records_for_export(
+        "联系人", "filtered", [], include_deleted=False
+    )
+    all_records = page._records_for_export(
+        "联系人", "all", [], include_deleted=False
+    )
+    assert [record.message.text for record in filtered] == ["苹果"]
+    assert [record.message.text for record in all_records] == ["苹果", "香蕉"]

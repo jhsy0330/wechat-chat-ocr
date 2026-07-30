@@ -384,16 +384,31 @@ class ArchiveStore:
             self._add_revision(connection, message_id, "edit", before, after)
 
     def set_message_deleted(self, message_id: int, deleted: bool) -> None:
+        self.set_messages_deleted([message_id], deleted)
+
+    def set_messages_deleted(
+        self, message_ids: Sequence[int], deleted: bool
+    ) -> None:
+        unique_ids = list(dict.fromkeys(message_ids))
+        if not unique_ids:
+            return
         with self._connect() as connection:
-            before = self._message_snapshot(connection, message_id)
-            connection.execute(
-                "UPDATE messages SET is_deleted = ? WHERE id = ?",
-                (1 if deleted else 0, message_id),
-            )
-            after = self._message_snapshot(connection, message_id)
-            self._add_revision(
-                connection, message_id, "delete" if deleted else "restore", before, after
-            )
+            for message_id in unique_ids:
+                before = self._message_snapshot(connection, message_id)
+                if bool(before["is_deleted"]) == deleted:
+                    continue
+                connection.execute(
+                    "UPDATE messages SET is_deleted = ? WHERE id = ?",
+                    (1 if deleted else 0, message_id),
+                )
+                after = self._message_snapshot(connection, message_id)
+                self._add_revision(
+                    connection,
+                    message_id,
+                    "delete" if deleted else "restore",
+                    before,
+                    after,
+                )
 
     def load_message_revisions(self, message_id: int) -> list[dict[str, object]]:
         with closing(self._connect()) as connection:
