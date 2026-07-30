@@ -68,12 +68,19 @@ def parse_page(
             height=line.height,
             visible_time=visible_time,
             occurred_at=occurred_at,
+            occurred_date=occurred_at[:10] if occurred_at else None,
+            date_source="recognized" if occurred_at else "unresolved",
             kind="system" if speaker == "系统" else "text",
+            original_text=line.text.strip(),
         )
 
         if messages and _should_join(messages[-1], message):
             previous = messages[-1]
+            previous_original = previous.original_text or previous.text
             previous.text = f"{previous.text}\n{message.text}"
+            previous.original_text = (
+                f"{previous_original}\n{message.original_text or message.text}"
+            )
             previous.confidence = min(previous.confidence, message.confidence)
             left = min(previous.x, message.x)
             top = min(previous.y, message.y)
@@ -122,20 +129,35 @@ def overlap_length(
 
 
 def merge_capture_pages(
-    pages_newest_first: Sequence[Sequence[Message]],
+    pages_in_capture_order: Sequence[Sequence[Message]],
+    direction: str = "up",
 ) -> list[Message]:
+    if direction not in {"up", "down"}:
+        raise ValueError("采集方向必须是 up 或 down")
     merged: list[Message] = []
-    for page in reversed(pages_newest_first):
+    chronological_pages = (
+        reversed(pages_in_capture_order)
+        if direction == "up"
+        else iter(pages_in_capture_order)
+    )
+    for page in chronological_pages:
         overlap = overlap_length(merged, page, allow_short_single=True)
         merged.extend(page[overlap:])
-    current_visible_time: str | None = None
-    current_occurred_at: str | None = None
+    current_date: str | None = None
     for sequence, message in enumerate(merged, 1):
         message.sequence = sequence
-        if message.kind == "system" and message.occurred_at:
-            current_visible_time = message.visible_time
-            current_occurred_at = message.occurred_at
-        elif message.kind != "system" and current_occurred_at:
-            message.visible_time = current_visible_time
-            message.occurred_at = current_occurred_at
+        explicit_date = message.occurred_date
+        if not explicit_date and message.occurred_at:
+            explicit_date = message.occurred_at[:10]
+        if explicit_date:
+            current_date = explicit_date
+            message.occurred_date = explicit_date
+            if message.date_source == "unresolved":
+                message.date_source = "recognized"
+        elif current_date:
+            message.occurred_date = current_date
+            message.date_source = "inherited"
+        else:
+            message.occurred_date = None
+            message.date_source = "unresolved"
     return merged

@@ -37,6 +37,8 @@ class CaptureEngine:
         on_status: StatusCallback = lambda _message: None,
         on_page: PageCallback = lambda _number, _path: None,
     ) -> list[Path]:
+        if settings.direction not in {"up", "down"}:
+            raise ValueError("采集方向必须是 up 或 down")
         self._stop.clear()
         session_name = datetime.now().strftime("%Y%m%d-%H%M%S")
         session_dir = settings.session_dir / session_name
@@ -67,9 +69,15 @@ class CaptureEngine:
             if not macos.is_frontmost_wechat(settings.window):
                 raise RuntimeError("微信失去焦点，已停止以避免滚动其他窗口")
 
-            on_status(f"向上滚动，准备第 {page_number} 页")
+            direction_text = "向上" if settings.direction == "up" else "向下"
+            on_status(f"{direction_text}滚动，准备第 {page_number} 页")
+            scroll_delta = (
+                settings.scroll_pixels
+                if settings.direction == "up"
+                else -settings.scroll_pixels
+            )
             macos.post_scroll(
-                settings.region.screen_point(settings.window), settings.scroll_pixels
+                settings.region.screen_point(settings.window), scroll_delta
             )
             time.sleep(0.25)
             stable_image = self._wait_for_stability(settings, working_dir, page_number)
@@ -77,7 +85,8 @@ class CaptureEngine:
                 unchanged += 1
                 on_status(f"页面没有明显变化（{unchanged}/{settings.unchanged_limit}）")
                 if unchanged >= settings.unchanged_limit:
-                    on_status("已到达可读取记录的顶部")
+                    edge = "顶部" if settings.direction == "up" else "底部"
+                    on_status(f"已到达可读取记录的{edge}")
                     break
                 continue
 

@@ -1,12 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 from jinja2 import BaseLoader, Environment, select_autoescape
 
-from .models import Message
+from .models import ArchivedMessage, Message
+
+
+EXPORT_FIELDS = {
+    "sequence": "序号",
+    "date": "日期",
+    "time": "时间",
+    "speaker": "发送人",
+    "text": "修正后文字",
+    "original_text": "OCR 原始文字",
+    "confidence": "置信度",
+    "visible_time": "微信原始时间",
+    "date_source": "日期来源",
+    "screenshot_path": "截图路径",
+    "coordinates": "OCR 坐标",
+    "edited_at": "修改时间",
+    "is_deleted": "已删除",
+}
+
+DEFAULT_EXPORT_FIELDS = ("date", "time", "speaker", "text", "screenshot_path")
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -78,6 +98,119 @@ def export_archive(
         encoding="utf-8",
     )
     return html_path, markdown_path, json_path
+
+
+def export_records(
+    records: list[ArchivedMessage],
+    partner_name: str,
+    output_base: Path,
+    *,
+    formats: set[str],
+    fields: list[str],
+    archive_root: Path,
+) -> dict[str, Path]:
+    """Export selected metadata only; screenshot files are never copied or embedded."""
+    unknown_formats = formats - {"json", "markdown", "xlsx", "html"}
+    unknown_fields = set(fields) - EXPORT_FIELDS.keys()
+    if unknown_formats or unknown_fields:
+        raise ValueError("包含不支持的导出格式或字段")
+    if not formats or not fields:
+        raise ValueError("至少选择一种格式和一个字段")
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        _record_values(record, fields, archive_root)
+        for record in records
+    ]
+    labels = [EXPORT_FIELDS[field] for field in fields]
+    outputs: dict[str, Path] = {}
+
+    if "json" in formats:
+        path = output_base.with_suffix(".json")
+        path.write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        outputs["json"] = path
+    if "markdown" in formats:
+        path = output_base.with_suffix(".md")
+        header = "| " + " | ".join(labels) + " |"
+        separator = "| " + " | ".join("---" for _ in labels) + " |"
+        body = [
+            "| "
+            + " | ".join(_markdown_cell(row[field]) for field in fields)
+            + " |"
+            for row in rows
+        ]
+        path.write_text(
+            "\n".join([f"# {partner_name} 微信聊天记录", "", header, separator, *body]),
+            encoding="utf-8",
+        )
+        outputs["markdown"] = path
+    if "html" in formats:
+        path = output_base.with_suffix(".html")
+        environment = Environment(
+            loader=BaseLoader(), autoescape=select_autoescape(default=True)
+        )
+        template = environment.from_string(
+            """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">
+<title>{{ partner }} - 微信聊天记录</title><style>
+body{font:14px/1.5 -apple-system,BlinkMacSystemFont,\"PingFang SC\",sans-serif;margin:24px;color:#202124}
+table{border-collapse:collapse;width:100%}th,td{border:1px solid #dfe2e5;padding:7px;text-align:left;vertical-align:top;white-space:pre-wrap}th{background:#f4f5f6;position:sticky;top:0}
+</style></head><body><h1>{{ partner }}</h1><table><thead><tr>{% for label in labels %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+<tbody>{% for row in rows %}<tr>{% for field in fields %}<td>{{ row[field] }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></body></html>"""
+        )
+        path.write_text(
+            template.render(partner=partner_name, labels=labels, fields=fields, rows=rows),
+            encoding="utf-8",
+        )
+        outputs["html"] = path
+    if "xlsx" in formats:
+        from openpyxl import Workbook
+
+        path = output_base.with_suffix(".xlsx")
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "聊天记录"
+        sheet.append(labels)
+        for row in rows:
+            sheet.append([row[field] for field in fields])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        workbook.save(path)
+        outputs["xlsx"] = path
+    return outputs
+
+
+def _record_values(
+    record: ArchivedMessage, fields: list[str], archive_root: Path
+) -> dict[str, object]:
+    message = record.message
+    occurred_time = ""
+    if message.occurred_at:
+        try:
+            occurred_time = datetime.fromisoformat(message.occurred_at).strftime("%H:%M")
+        except ValueError:
+            occurred_time = message.occurred_at
+    screenshot_path = os.path.relpath(record.source_path.resolve(), archive_root.resolve())
+    values: dict[str, object] = {
+        "sequence": message.sequence,
+        "date": message.occurred_date or "",
+        "time": occurred_time,
+        "speaker": message.speaker,
+        "text": message.text,
+        "original_text": message.original_text or message.text,
+        "confidence": round(message.confidence, 4),
+        "visible_time": message.visible_time or "",
+        "date_source": message.date_source,
+        "screenshot_path": screenshot_path,
+        "coordinates": f"{message.x:.6f},{message.y:.6f},{message.width:.6f},{message.height:.6f}",
+        "edited_at": message.edited_at or "",
+        "is_deleted": message.is_deleted,
+    }
+    return {field: values[field] for field in fields}
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", "<br>")
 
 
 def _display_time(value: str | None) -> str:

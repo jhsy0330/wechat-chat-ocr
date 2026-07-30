@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal, QSettings
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -163,8 +164,9 @@ class RegionDialog(QDialog):
 class CapturePage(QWidget):
     archive_changed = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, data_dir: Path = DATA_DIR) -> None:
         super().__init__()
+        self.data_dir = data_dir
         self.region = NormalizedRegion()
         self.windows: list[WindowInfo] = []
         self.worker: ArchiveWorker | None = None
@@ -230,10 +232,17 @@ class CapturePage(QWidget):
         self.scroll_pixels.setValue(650)
         self.scroll_pixels.setSingleStep(50)
         self.scroll_pixels.setSuffix(" px")
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItem("从最新消息向上读取", "up")
+        self.direction_combo.addItem("从最早消息向下读取", "down")
+        self.direction_combo.currentIndexChanged.connect(self._direction_changed)
+        settings_row.addWidget(self.direction_combo)
+        settings_row.addSpacing(18)
         settings_row.addWidget(QLabel("最多读取"))
         settings_row.addWidget(self.max_pages)
         settings_row.addSpacing(18)
-        settings_row.addWidget(QLabel("每次向上滚动"))
+        self.scroll_direction_label = QLabel("每次向上滚动")
+        settings_row.addWidget(self.scroll_direction_label)
         settings_row.addWidget(self.scroll_pixels)
         settings_row.addStretch()
         form.addRow("采集设置", settings_row)
@@ -356,10 +365,11 @@ class CapturePage(QWidget):
             partner_name=partner,
             max_pages=self.max_pages.value(),
             scroll_pixels=self.scroll_pixels.value(),
-            session_dir=DATA_DIR / "captures",
+            session_dir=self.data_dir / "captures",
+            direction=str(self.direction_combo.currentData()),
         )
         self.thread = QThread(self)
-        self.worker = ArchiveWorker(settings, DATA_DIR)
+        self.worker = ArchiveWorker(settings, self.data_dir)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.status_label.setText)
@@ -463,6 +473,20 @@ class CapturePage(QWidget):
             self.status_label.setText("等待开始")
             self.refresh_windows()
 
+    def _direction_changed(self) -> None:
+        direction = str(self.direction_combo.currentData())
+        self.scroll_direction_label.setText(
+            "每次向上滚动" if direction == "up" else "每次向下滚动"
+        )
+
+    def set_data_dir(self, data_dir: Path) -> None:
+        if self.worker is not None:
+            raise RuntimeError("采集进行中不能切换归档目录")
+        self.data_dir = data_dir
+        self.last_export = None
+        self.open_export_button.setEnabled(False)
+        self.status_label.setText(f"归档目录：{data_dir}")
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -477,14 +501,35 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
+        header = QHBoxLayout()
         title = QLabel("微信聊天归档")
         title.setObjectName("title")
-        root.addWidget(title)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(QLabel("归档目录"))
+        self.archive_path = QLineEdit()
+        self.archive_path.setReadOnly(True)
+        self.archive_path.setMinimumWidth(420)
+        header.addWidget(self.archive_path)
+        choose_archive = QPushButton("选择目录")
+        choose_archive.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+        )
+        choose_archive.clicked.connect(self.choose_archive_root)
+        header.addWidget(choose_archive)
+        root.addLayout(header)
+
+        self.settings = QSettings()
+        saved_root = Path(str(self.settings.value("archive/root", str(DATA_DIR))))
+        self.archive_root = saved_root.expanduser().resolve()
+        self.archive_root.mkdir(parents=True, exist_ok=True)
+        self.archive_path.setText(str(self.archive_root))
+        self.archive_path.setToolTip(str(self.archive_root))
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.capture_page = CapturePage()
-        self.viewer_page = ArchiveViewerPage(DATA_DIR / "archive.sqlite3")
+        self.capture_page = CapturePage(self.archive_root)
+        self.viewer_page = ArchiveViewerPage(self.archive_root / "archive.sqlite3")
         self.capture_tab_index = self.tabs.addTab(self.capture_page, "获取聊天记录")
         self.viewer_tab_index = self.tabs.addTab(self.viewer_page, "查看聊天记录")
         self.capture_page.archive_changed.connect(self.viewer_page.refresh_archive)
@@ -543,6 +588,32 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def choose_archive_root(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "选择聊天归档目录", str(self.archive_root)
+        )
+        if not selected:
+            return
+        archive_root = Path(selected).expanduser().resolve()
+        if archive_root == self.archive_root:
+            return
+        if (
+            self.capture_page.worker is not None
+            or self.viewer_page.maintenance_running()
+        ):
+            QMessageBox.warning(self, "无法切换归档目录", "请先等待采集或档案整理任务结束。")
+            return
+        try:
+            self.viewer_page.set_database_path(archive_root / "archive.sqlite3")
+            self.capture_page.set_data_dir(archive_root)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.warning(self, "无法切换归档目录", str(error))
+            return
+        self.archive_root = archive_root
+        self.archive_path.setText(str(archive_root))
+        self.archive_path.setToolTip(str(archive_root))
+        self.settings.setValue("archive/root", str(archive_root))
 
     def closeEvent(self, event: QCloseEvent) -> None:
         capture_ready = self.capture_page.request_close()

@@ -56,7 +56,9 @@ class ArchiveWorker(QObject):
                         reference_time=reference_time,
                     )
                 )
-            current_messages = merge_capture_pages(parsed_pages)
+            current_messages = merge_capture_pages(
+                parsed_pages, direction=self.settings.direction
+            )
 
             store = ArchiveStore(self.data_dir / "archive.sqlite3")
             filter_cache: OrderedDict[Path, TextMessageFilter] = OrderedDict()

@@ -4,11 +4,15 @@ from datetime import datetime
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QThread, QUrl, Signal, Slot, QSettings
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -17,20 +21,181 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QMessageBox,
     QSplitter,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QTextEdit,
+    QGroupBox,
 )
 
+from .exporter import DEFAULT_EXPORT_FIELDS, EXPORT_FIELDS, export_records
 from .models import ArchivedMessage, ChatSummary, Message
 from .storage import ArchiveStore
 from .visibility import ArchiveVisibilityScanner
 
 
 PAGE_SIZE = 200
+
+
+class EditMessageDialog(QDialog):
+    def __init__(self, record: ArchivedMessage, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("修改聊天记录")
+        message = record.message
+        layout = QFormLayout(self)
+        self.text_edit = QTextEdit(message.text)
+        self.text_edit.setMinimumHeight(120)
+        layout.addRow("消息内容", self.text_edit)
+        self.speaker_edit = QLineEdit(message.speaker)
+        layout.addRow("发送人", self.speaker_edit)
+        self.date_edit = QLineEdit(message.occurred_date or "")
+        self.date_edit.setPlaceholderText("YYYY-MM-DD，可留空")
+        layout.addRow("日期", self.date_edit)
+        occurred_time = ""
+        if message.occurred_at:
+            try:
+                occurred_time = datetime.fromisoformat(message.occurred_at).strftime("%H:%M")
+            except ValueError:
+                pass
+        self.time_edit = QLineEdit(occurred_time)
+        self.time_edit.setPlaceholderText("HH:MM，可留空")
+        layout.addRow("时间", self.time_edit)
+        original = QLabel(message.original_text or message.text)
+        original.setWordWrap(True)
+        original.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addRow("OCR 原文", original)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+        self.resize(520, 340)
+
+    def values(self) -> tuple[str, str, str | None, str | None]:
+        return (
+            self.text_edit.toPlainText().strip(),
+            self.speaker_edit.text().strip(),
+            self.date_edit.text().strip() or None,
+            self.time_edit.text().strip() or None,
+        )
+
+
+class ExportDialog(QDialog):
+    FORMATS = (
+        ("json", "JSON"),
+        ("markdown", "Markdown"),
+        ("xlsx", "Excel .xlsx"),
+        ("html", "HTML"),
+    )
+
+    def __init__(self, selected_count: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("导出聊天记录")
+        self.settings = QSettings()
+        root = QVBoxLayout(self)
+        scope_box = QGroupBox("导出范围")
+        scope_layout = QVBoxLayout(scope_box)
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("全部可见记录", "all")
+        self.scope_combo.addItem("当前筛选结果", "filtered")
+        self.scope_combo.addItem(f"已选择记录（{selected_count} 条）", "selected")
+        if selected_count == 0:
+            self.scope_combo.model().item(2).setEnabled(False)
+        saved_scope = str(self.settings.value("export/scope", "filtered"))
+        index = self.scope_combo.findData(saved_scope)
+        self.scope_combo.setCurrentIndex(index if index >= 0 else 1)
+        scope_layout.addWidget(self.scope_combo)
+        root.addWidget(scope_box)
+
+        format_box = QGroupBox("文件格式")
+        format_layout = QHBoxLayout(format_box)
+        saved_formats = set(str(self.settings.value("export/formats", "json,xlsx")).split(","))
+        self.format_checks: dict[str, QCheckBox] = {}
+        for key, label in self.FORMATS:
+            check = QCheckBox(label)
+            check.setChecked(key in saved_formats)
+            self.format_checks[key] = check
+            format_layout.addWidget(check)
+        root.addWidget(format_box)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("字段预设"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("简洁", "concise")
+        self.preset_combo.addItem("审计", "audit")
+        self.preset_combo.addItem("自定义", "custom")
+        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
+        preset_row.addWidget(self.preset_combo)
+        preset_row.addStretch()
+        root.addLayout(preset_row)
+
+        field_box = QGroupBox("导出字段")
+        field_layout = QFormLayout(field_box)
+        saved_fields = set(
+            str(
+                self.settings.value(
+                    "export/fields", ",".join(DEFAULT_EXPORT_FIELDS)
+                )
+            ).split(",")
+        )
+        self.field_checks: dict[str, QCheckBox] = {}
+        for key, label in EXPORT_FIELDS.items():
+            check = QCheckBox(label)
+            check.setChecked(key in saved_fields)
+            check.toggled.connect(self._mark_custom)
+            self.field_checks[key] = check
+            field_layout.addRow(check)
+        root.addWidget(field_box)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("导出")
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.resize(480, 650)
+
+    def _apply_preset(self) -> None:
+        preset = self.preset_combo.currentData()
+        if preset == "custom":
+            return
+        fields = set(DEFAULT_EXPORT_FIELDS) if preset == "concise" else set(EXPORT_FIELDS)
+        for key, check in self.field_checks.items():
+            check.blockSignals(True)
+            check.setChecked(key in fields)
+            check.blockSignals(False)
+
+    def _mark_custom(self) -> None:
+        index = self.preset_combo.findData("custom")
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(index)
+        self.preset_combo.blockSignals(False)
+
+    def _validate(self) -> None:
+        if not self.formats() or not self.fields():
+            QMessageBox.warning(
+                self, "无法导出", "请至少选择一种格式和一个字段。"
+            )
+            return
+        self.settings.setValue("export/scope", self.scope())
+        self.settings.setValue("export/formats", ",".join(sorted(self.formats())))
+        self.settings.setValue("export/fields", ",".join(self.fields()))
+        self.accept()
+
+    def scope(self) -> str:
+        return str(self.scope_combo.currentData())
+
+    def formats(self) -> set[str]:
+        return {key for key, check in self.format_checks.items() if check.isChecked()}
+
+    def fields(self) -> list[str]:
+        return [key for key, check in self.field_checks.items() if check.isChecked()]
 
 
 def message_highlight_rect(message: Message, image_rect: QRectF) -> QRectF:
@@ -149,6 +314,7 @@ class ArchiveViewerPage(QWidget):
         self.current_page = 0
         self.total_messages = 0
         self.current_record: ArchivedMessage | None = None
+        self.include_deleted = False
         self.visibility_worker: VisibilityWorker | None = None
         self.visibility_thread: QThread | None = None
         self._build_ui()
@@ -168,6 +334,10 @@ class ArchiveViewerPage(QWidget):
         self.archive_status.setObjectName("status")
         toolbar.addWidget(self.archive_status)
         toolbar.addStretch()
+        self.export_button = QPushButton("导出")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self._export_records)
+        toolbar.addWidget(self.export_button)
         self.refresh_button = QPushButton("刷新档案")
         self.refresh_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
@@ -225,10 +395,27 @@ class ArchiveViewerPage(QWidget):
         self.speaker_filter.addItem("全部发送方", None)
         self.speaker_filter.currentIndexChanged.connect(self._apply_message_filters)
         filters.addWidget(self.speaker_filter)
+        self.deleted_filter = QCheckBox("显示已删除")
+        self.deleted_filter.toggled.connect(self._toggle_deleted)
+        filters.addWidget(self.deleted_filter)
         layout.addLayout(filters)
 
-        self.message_table = QTableWidget(0, 4)
-        self.message_table.setHorizontalHeaderLabels(["日期时间", "发送方", "内容", "来源截图"])
+        actions = QHBoxLayout()
+        self.edit_button = QPushButton("修改")
+        self.edit_button.setEnabled(False)
+        self.edit_button.clicked.connect(self._edit_current)
+        actions.addWidget(self.edit_button)
+        self.delete_button = QPushButton("删除")
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._toggle_current_deleted)
+        actions.addWidget(self.delete_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.message_table = QTableWidget(0, 5)
+        self.message_table.setHorizontalHeaderLabels(
+            ["日期时间", "发送方", "内容", "状态", "来源截图"]
+        )
         self.message_table.verticalHeader().setVisible(False)
         self.message_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
@@ -242,12 +429,15 @@ class ArchiveViewerPage(QWidget):
         self.message_table.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents
         )
+        self.message_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.message_table.setAlternatingRowColors(True)
         self.message_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         self.message_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.message_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.message_table.currentCellChanged.connect(self._message_selected)
@@ -369,7 +559,8 @@ class ArchiveViewerPage(QWidget):
         query = self.message_search.text().strip()
         speaker = self.speaker_filter.currentData()
         self.total_messages = self.store.count_chat_messages(
-            partner_name, query=query, speaker=speaker
+            partner_name, query=query, speaker=speaker,
+            include_deleted=self.include_deleted
         )
         page_count = (self.total_messages + PAGE_SIZE - 1) // PAGE_SIZE
         if page_count:
@@ -383,6 +574,7 @@ class ArchiveViewerPage(QWidget):
             limit=PAGE_SIZE,
             offset=self.current_page * PAGE_SIZE,
             newest_first=True,
+            include_deleted=self.include_deleted,
         )
 
         self.message_table.blockSignals(True)
@@ -390,9 +582,10 @@ class ArchiveViewerPage(QWidget):
         for row, record in enumerate(self.page_records):
             message = record.message
             values = (
-                _display_datetime(message.occurred_at),
+                _display_message_datetime(message),
                 message.speaker,
                 message.text.replace("\n", " "),
+                _message_status(message),
                 record.source_path.name if record.source_path.is_file() else "截图缺失",
             )
             for column, value in enumerate(values):
@@ -403,6 +596,7 @@ class ArchiveViewerPage(QWidget):
         self.message_table.blockSignals(False)
 
         self.message_count_label.setText(f"{self.total_messages} 条文字记录")
+        self.export_button.setEnabled(self.total_messages > 0)
         self.page_label.setText(
             f"{self.current_page + 1} / {page_count}" if page_count else "0 / 0"
         )
@@ -416,6 +610,8 @@ class ArchiveViewerPage(QWidget):
             self.screenshot_viewer.clear("没有匹配的文字记录")
             self.source_detail.setText("未选择记录")
             self.open_source_button.setEnabled(False)
+            self.edit_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
 
     def _message_selected(
         self,
@@ -444,6 +640,9 @@ class ArchiveViewerPage(QWidget):
         )
         self.source_detail.setToolTip(str(record.source_path))
         self.open_source_button.setEnabled(available)
+        self.edit_button.setEnabled(True)
+        self.delete_button.setEnabled(True)
+        self.delete_button.setText("恢复" if message.is_deleted else "删除")
 
     def _clear_messages(self, title: str) -> None:
         self.chat_title.setText(title)
@@ -458,6 +657,9 @@ class ArchiveViewerPage(QWidget):
         self.screenshot_viewer.clear()
         self.source_detail.setText("未选择记录")
         self.open_source_button.setEnabled(False)
+        self.edit_button.setEnabled(False)
+        self.delete_button.setEnabled(False)
+        self.export_button.setEnabled(False)
 
     def _previous_page(self) -> None:
         if self.current_page > 0:
@@ -468,6 +670,107 @@ class ArchiveViewerPage(QWidget):
         if (self.current_page + 1) * PAGE_SIZE < self.total_messages:
             self.current_page += 1
             self._load_message_page()
+
+    def _toggle_deleted(self, checked: bool) -> None:
+        self.include_deleted = checked
+        self._apply_message_filters()
+
+    def _edit_current(self) -> None:
+        if self.current_record is None:
+            return
+        dialog = EditMessageDialog(self.current_record, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            text, speaker, occurred_date, occurred_time = dialog.values()
+            self.store.update_message(
+                self.current_record.message_id,
+                text=text,
+                speaker=speaker,
+                occurred_date=occurred_date,
+                occurred_time=occurred_time,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "修改失败", str(error))
+            return
+        self.refresh_archive()
+
+    def _toggle_current_deleted(self) -> None:
+        if self.current_record is None:
+            return
+        deleted = not self.current_record.message.is_deleted
+        verb = "删除" if deleted else "恢复"
+        if deleted:
+            answer = QMessageBox.question(
+                self,
+                "删除聊天记录",
+                "这条记录将被隐藏，但仍可通过“显示已删除”恢复。是否继续？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.store.set_message_deleted(self.current_record.message_id, deleted)
+        self.archive_status.setText(f"记录已{verb}")
+        self.refresh_archive()
+
+    def _selected_records(self) -> list[ArchivedMessage]:
+        rows = sorted({index.row() for index in self.message_table.selectedIndexes()})
+        return [self.page_records[row] for row in rows if 0 <= row < len(self.page_records)]
+
+    def _export_records(self) -> None:
+        partner_name = self._selected_partner_name()
+        if partner_name is None:
+            return
+        selected = self._selected_records()
+        dialog = ExportDialog(len(selected), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        scope = dialog.scope()
+        if scope == "selected":
+            records = selected
+        else:
+            query = self.message_search.text().strip() if scope == "filtered" else ""
+            speaker = self.speaker_filter.currentData() if scope == "filtered" else None
+            records = self.store.load_chat_messages(
+                partner_name,
+                query=query,
+                speaker=speaker,
+                newest_first=False,
+                include_deleted=self.include_deleted,
+            )
+        if not records:
+            QMessageBox.information(
+                self, "没有可导出内容", "当前范围没有聊天记录。"
+            )
+            return
+        output = self.database_path.parent / "exports" / datetime.now().strftime(
+            "chat-%Y%m%d-%H%M%S"
+        )
+        try:
+            outputs = export_records(
+                records,
+                partner_name,
+                output,
+                formats=dialog.formats(),
+                fields=dialog.fields(),
+                archive_root=self.database_path.parent,
+            )
+        except (OSError, ValueError, ImportError) as error:
+            QMessageBox.critical(self, "导出失败", str(error))
+            return
+        paths = "\n".join(str(path) for path in outputs.values())
+        QMessageBox.information(self, "导出完成", paths)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
+
+    def set_database_path(self, database_path: Path) -> None:
+        if database_path == self.database_path:
+            return
+        if self.maintenance_running():
+            raise RuntimeError("旧档案整理期间不能切换归档目录")
+        self.database_path = database_path
+        self.store = ArchiveStore(database_path)
+        self.current_page = 0
+        self.refresh_archive()
+        self._start_visibility_scan()
 
     def _start_visibility_scan(self) -> None:
         total = self.store.unreviewed_message_count()
@@ -538,3 +841,24 @@ def _display_datetime(value: str | None) -> str:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
     except ValueError:
         return value
+
+
+def _display_message_datetime(message: Message) -> str:
+    if message.occurred_at:
+        return _display_datetime(message.occurred_at)
+    return message.occurred_date or ""
+
+
+def _message_status(message: Message) -> str:
+    states: list[str] = []
+    if message.is_deleted:
+        states.append("已删除")
+    if message.edited_at:
+        states.append("已修改")
+    if message.date_source == "inherited":
+        states.append("日期继承")
+    elif message.date_source == "unresolved":
+        states.append("日期待补")
+    elif message.date_source == "manual":
+        states.append("日期手动")
+    return " · ".join(states)

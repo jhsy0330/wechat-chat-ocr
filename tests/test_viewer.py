@@ -4,13 +4,14 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import QRectF
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtWidgets import QApplication
 
 from wechat_archive.models import ArchivedMessage, Message
 from wechat_archive.storage import ArchiveStore
 from wechat_archive.viewer import (
     ArchiveViewerPage,
+    ExportDialog,
     ScreenshotViewer,
     message_highlight_rect,
 )
@@ -111,3 +112,42 @@ def test_viewer_uses_database_pagination(tmp_path: Path, monkeypatch) -> None:
     page._next_page()
     assert page.current_record is not None
     assert page.current_record.message.text == "较早"
+
+
+def test_viewer_can_show_deleted_and_switch_archive_root(tmp_path: Path) -> None:
+    application()
+    first_database = tmp_path / "first" / "archive.sqlite3"
+    first = ArchiveStore(first_database)
+    first.append_session(
+        "联系人甲",
+        [make_message("待删除", "page.png", "2026-07-30T20:00+08:00")],
+        1,
+        tmp_path / "first" / "captures" / "one",
+    )
+    record = first.load_chat_messages("联系人甲")[0]
+    first.set_message_deleted(record.message_id, True)
+    second_database = tmp_path / "second" / "archive.sqlite3"
+    second = ArchiveStore(second_database)
+    second.append_session(
+        "联系人乙",
+        [make_message("另一份档案", "page.png", "2026-07-30T21:00+08:00")],
+        1,
+        tmp_path / "second" / "captures" / "one",
+    )
+
+    page = ArchiveViewerPage(first_database)
+    assert page.message_table.rowCount() == 0
+    page.deleted_filter.setChecked(True)
+    assert page.message_table.rowCount() == 1
+    assert page.message_table.item(0, 3).text().startswith("已删除")
+    page.set_database_path(second_database)
+    assert page.chat_list.item(0).data(Qt.ItemDataRole.UserRole) == "联系人乙"
+
+
+def test_export_dialog_disables_selected_scope_when_nothing_selected() -> None:
+    application()
+    dialog = ExportDialog(0)
+    selected_item = dialog.scope_combo.model().item(2)
+    assert not selected_item.isEnabled()
+    assert dialog.formats()
+    assert dialog.fields()

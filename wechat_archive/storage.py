@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -43,7 +44,20 @@ CREATE TABLE IF NOT EXISTS messages (
     occurred_at TEXT,
     kind TEXT NOT NULL,
     is_visible INTEGER DEFAULT 1,
+    original_text TEXT,
+    occurred_date TEXT,
+    date_source TEXT NOT NULL DEFAULT 'unresolved',
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    edited_at TEXT,
     UNIQUE(chat_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS message_revisions (
+    id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    action TEXT NOT NULL,
+    before_json TEXT NOT NULL,
+    after_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_chat_sequence
 ON messages(chat_id, sequence);
@@ -58,8 +72,7 @@ class ArchiveStore:
             connection.executescript(SCHEMA)
             self._migrate(connection)
 
-    @staticmethod
-    def _migrate(connection: sqlite3.Connection) -> None:
+    def _migrate(self, connection: sqlite3.Connection) -> None:
         columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(messages)")
         }
@@ -68,12 +81,79 @@ class ArchiveStore:
         if "is_visible" not in columns:
             # NULL distinguishes legacy rows that still need screenshot validation.
             connection.execute("ALTER TABLE messages ADD COLUMN is_visible INTEGER")
+        additions = {
+            "original_text": "TEXT",
+            "occurred_date": "TEXT",
+            "date_source": "TEXT NOT NULL DEFAULT 'unresolved'",
+            "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+            "edited_at": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE messages ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "UPDATE messages SET original_text = text WHERE original_text IS NULL"
+        )
+        connection.execute(
+            """
+            UPDATE messages
+            SET occurred_date = substr(occurred_at, 1, 10)
+            WHERE occurred_date IS NULL AND occurred_at IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE messages
+            SET date_source = CASE
+                WHEN occurred_date IS NOT NULL AND occurred_date != '' THEN 'recognized'
+                ELSE 'unresolved'
+            END
+            WHERE date_source IS NULL OR date_source = '' OR date_source = 'unresolved'
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_revisions (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL REFERENCES messages(id),
+                action TEXT NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS revisions_message_created
+            ON message_revisions(message_id, created_at)
+            """
+        )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS messages_chat_visible_sequence
             ON messages(chat_id, is_visible, sequence)
             """
         )
+        self._migrate_session_paths(connection)
+
+    def _migrate_session_paths(self, connection: sqlite3.Connection) -> None:
+        archive_root = self.path.parent.resolve()
+        rows = connection.execute("SELECT id, session_dir FROM sessions").fetchall()
+        for row in rows:
+            stored = Path(str(row["session_dir"])).expanduser()
+            if not stored.is_absolute():
+                continue
+            try:
+                relative = stored.resolve().relative_to(archive_root)
+            except ValueError:
+                continue
+            connection.execute(
+                "UPDATE sessions SET session_dir = ? WHERE id = ?",
+                (str(relative), int(row["id"])),
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
@@ -114,17 +194,18 @@ class ArchiveStore:
                     c.partner_name,
                     COUNT(m.id) AS message_count,
                     (
-                        SELECT latest.occurred_at
+                        SELECT COALESCE(latest.occurred_at, latest.occurred_date)
                         FROM messages latest
                         WHERE latest.chat_id = c.id
                           AND latest.is_visible = 1
-                          AND latest.occurred_at IS NOT NULL
-                          AND latest.occurred_at != ''
+                          AND latest.is_deleted = 0
+                          AND (latest.occurred_at IS NOT NULL OR latest.occurred_date IS NOT NULL)
                         ORDER BY latest.sequence DESC, latest.id DESC
                         LIMIT 1
                     ) AS latest_occurred_at
                 FROM chats c
-                LEFT JOIN messages m ON m.chat_id = c.id AND m.is_visible = 1
+                LEFT JOIN messages m ON m.chat_id = c.id
+                    AND m.is_visible = 1 AND m.is_deleted = 0
                 GROUP BY c.id, c.partner_name
                 """
             ).fetchall()
@@ -154,9 +235,13 @@ class ArchiveStore:
         *,
         query: str = "",
         speaker: str | None = None,
+        include_deleted: bool = False,
     ) -> int:
         conditions, parameters = self._chat_message_filters(
-            partner_name, query=query, speaker=speaker
+            partner_name,
+            query=query,
+            speaker=speaker,
+            include_deleted=include_deleted,
         )
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -177,7 +262,7 @@ class ArchiveStore:
                 SELECT DISTINCT m.speaker
                 FROM messages m
                 JOIN chats c ON c.id = m.chat_id
-                WHERE c.partner_name = ? AND m.is_visible = 1
+                WHERE c.partner_name = ? AND m.is_visible = 1 AND m.is_deleted = 0
                 ORDER BY m.speaker COLLATE NOCASE
                 """,
                 (partner_name,),
@@ -193,13 +278,17 @@ class ArchiveStore:
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
+        include_deleted: bool = False,
     ) -> list[ArchivedMessage]:
         if limit is not None and limit <= 0:
             return []
         if offset < 0:
             raise ValueError("消息偏移量不能为负数")
         conditions, parameters = self._chat_message_filters(
-            partner_name, query=query, speaker=speaker
+            partner_name,
+            query=query,
+            speaker=speaker,
+            include_deleted=include_deleted,
         )
         order = "DESC" if newest_first else "ASC"
         pagination = ""
@@ -255,6 +344,115 @@ class ArchiveStore:
                 [(1 if visible else 0, message_id) for message_id, visible in results],
             )
 
+    def update_message(
+        self,
+        message_id: int,
+        *,
+        text: str,
+        speaker: str,
+        occurred_date: str | None,
+        occurred_time: str | None,
+    ) -> None:
+        text = text.strip()
+        speaker = speaker.strip()
+        if not text or not speaker:
+            raise ValueError("消息内容和发送人不能为空")
+        occurred_at = None
+        if occurred_time and not occurred_date:
+            raise ValueError("填写时间时必须同时填写日期")
+        if occurred_date:
+            try:
+                datetime.strptime(occurred_date, "%Y-%m-%d")
+                if occurred_time:
+                    datetime.strptime(occurred_time, "%H:%M")
+                    occurred_at = f"{occurred_date}T{occurred_time}"
+            except ValueError as error:
+                raise ValueError("日期应为 YYYY-MM-DD，时间应为 HH:MM") from error
+        with self._connect() as connection:
+            before = self._message_snapshot(connection, message_id)
+            edited_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            connection.execute(
+                """
+                UPDATE messages
+                SET text = ?, speaker = ?, occurred_date = ?, occurred_at = ?,
+                    date_source = 'manual', edited_at = ?
+                WHERE id = ?
+                """,
+                (text, speaker, occurred_date or None, occurred_at, edited_at, message_id),
+            )
+            after = self._message_snapshot(connection, message_id)
+            self._add_revision(connection, message_id, "edit", before, after)
+
+    def set_message_deleted(self, message_id: int, deleted: bool) -> None:
+        with self._connect() as connection:
+            before = self._message_snapshot(connection, message_id)
+            connection.execute(
+                "UPDATE messages SET is_deleted = ? WHERE id = ?",
+                (1 if deleted else 0, message_id),
+            )
+            after = self._message_snapshot(connection, message_id)
+            self._add_revision(
+                connection, message_id, "delete" if deleted else "restore", before, after
+            )
+
+    def load_message_revisions(self, message_id: int) -> list[dict[str, object]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT action, before_json, after_json, created_at
+                FROM message_revisions WHERE message_id = ? ORDER BY id
+                """,
+                (message_id,),
+            ).fetchall()
+        return [
+            {
+                "action": str(row["action"]),
+                "before": json.loads(str(row["before_json"])),
+                "after": json.loads(str(row["after_json"])),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _message_snapshot(
+        connection: sqlite3.Connection, message_id: int
+    ) -> dict[str, object]:
+        row = connection.execute(
+            """
+            SELECT text, speaker, occurred_date, occurred_at, date_source,
+                   is_deleted, edited_at
+            FROM messages WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("聊天记录不存在")
+        return {key: row[key] for key in row.keys()}
+
+    @staticmethod
+    def _add_revision(
+        connection: sqlite3.Connection,
+        message_id: int,
+        action: str,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO message_revisions(
+                message_id, action, before_json, after_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                action,
+                json.dumps(before, ensure_ascii=False),
+                json.dumps(after, ensure_ascii=False),
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+
     def append_session(
         self,
         partner_name: str,
@@ -274,6 +472,7 @@ class ArchiveStore:
                 (chat_id,),
             ).fetchall()
             all_existing = [self._row_to_message(row) for row in existing_rows]
+            overlap_existing: list[Message] = []
             visible_existing: list[Message] = []
             for message, row in zip(all_existing, existing_rows, strict=True):
                 stored_visibility = row["is_visible"]
@@ -281,7 +480,9 @@ class ArchiveStore:
                     visible = bool(stored_visibility)
                 elif existing_message_filter is not None:
                     visible = existing_message_filter(
-                        message, Path(str(row["session_dir"])) / message.source
+                        message,
+                        self.resolve_session_dir(str(row["session_dir"]))
+                        / message.source,
                     )
                     connection.execute(
                         "UPDATE messages SET is_visible = ? WHERE id = ?",
@@ -290,8 +491,10 @@ class ArchiveStore:
                 else:
                     visible = True
                 if visible:
-                    visible_existing.append(message)
-            overlap = overlap_length(visible_existing, messages)
+                    overlap_existing.append(message)
+                    if not bool(row["is_deleted"]):
+                        visible_existing.append(message)
+            overlap = overlap_length(overlap_existing, messages)
             additions = list(messages[overlap:])
 
             cursor = connection.execute(
@@ -303,7 +506,7 @@ class ArchiveStore:
                     chat_id,
                     datetime.now().isoformat(timespec="seconds"),
                     page_count,
-                    str(session_dir),
+                    self.portable_session_dir(session_dir),
                 ),
             )
             session_id = int(cursor.lastrowid)
@@ -317,8 +520,9 @@ class ArchiveStore:
                     INSERT INTO messages(
                         chat_id, session_id, sequence, speaker, text, confidence,
                         source, x, y, width, height, visible_time, occurred_at, kind,
-                        is_visible
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        is_visible, original_text, occurred_date, date_source,
+                        is_deleted, edited_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, NULL)
                     """,
                     (
                         chat_id,
@@ -335,6 +539,9 @@ class ArchiveStore:
                         message.visible_time,
                         message.occurred_at,
                         message.kind,
+                        message.original_text or message.text,
+                        message.occurred_date,
+                        message.date_source,
                     ),
                 )
         return visible_existing + additions, len(additions)
@@ -349,6 +556,14 @@ class ArchiveStore:
                 reference = datetime.now().astimezone()
             parsed = parse_wechat_timestamp(str(row["visible_time"]), reference)
             occurred_at = parsed.isoformat(timespec="minutes") if parsed else None
+        occurred_date = (
+            str(row["occurred_date"])
+            if row["occurred_date"]
+            else (str(occurred_at)[:10] if occurred_at else None)
+        )
+        date_source = str(row["date_source"]) if row["date_source"] else "unresolved"
+        if occurred_date and date_source == "unresolved":
+            date_source = "recognized"
         return Message(
             speaker=str(row["speaker"]),
             text=str(row["text"]),
@@ -362,14 +577,20 @@ class ArchiveStore:
             occurred_at=occurred_at,
             kind=str(row["kind"]),
             sequence=int(row["sequence"]),
+            original_text=(
+                str(row["original_text"])
+                if row["original_text"] is not None
+                else str(row["text"])
+            ),
+            occurred_date=occurred_date,
+            date_source=date_source,
+            is_deleted=bool(row["is_deleted"]),
+            edited_at=(str(row["edited_at"]) if row["edited_at"] else None),
         )
 
-    @classmethod
-    def _row_to_archived_message(cls, row: sqlite3.Row) -> ArchivedMessage:
-        message = cls._row_to_message(row)
-        source_path = (
-            Path(str(row["session_dir"])).expanduser() / message.source
-        ).resolve()
+    def _row_to_archived_message(self, row: sqlite3.Row) -> ArchivedMessage:
+        message = self._row_to_message(row)
+        source_path = (self.resolve_session_dir(str(row["session_dir"])) / message.source).resolve()
         return ArchivedMessage(
             message_id=int(row["id"]),
             partner_name=str(row["partner_name"]),
@@ -379,9 +600,12 @@ class ArchiveStore:
 
     @staticmethod
     def _chat_message_filters(
-        partner_name: str, *, query: str, speaker: str | None
+        partner_name: str, *, query: str, speaker: str | None,
+        include_deleted: bool = False
     ) -> tuple[list[str], list[object]]:
         conditions = ["c.partner_name = ?", "m.is_visible = 1"]
+        if not include_deleted:
+            conditions.append("m.is_deleted = 0")
         parameters: list[object] = [partner_name]
         if query:
             escaped = (
@@ -394,6 +618,23 @@ class ArchiveStore:
             parameters.append(speaker)
         return conditions, parameters
 
+    def portable_session_dir(self, session_dir: Path) -> str:
+        expanded = session_dir.expanduser()
+        try:
+            return str(expanded.resolve().relative_to(self.path.parent.resolve()))
+        except ValueError:
+            return str(expanded)
+
+    def resolve_session_dir(self, stored: str) -> Path:
+        path = Path(stored).expanduser()
+        return path if path.is_absolute() else self.path.parent / path
+
+    def relative_source_path(self, record: ArchivedMessage) -> str:
+        try:
+            return str(record.source_path.resolve().relative_to(self.path.parent.resolve()))
+        except ValueError:
+            return str(record.source_path)
+
     def _latest_legacy_timestamp(
         self, connection: sqlite3.Connection, chat_id: int
     ) -> str | None:
@@ -404,6 +645,7 @@ class ArchiveStore:
             JOIN sessions s ON s.id = m.session_id
             WHERE m.chat_id = ?
               AND m.is_visible = 1
+              AND m.is_deleted = 0
               AND m.visible_time IS NOT NULL
             ORDER BY m.sequence, m.id
             """,

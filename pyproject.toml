@@ -18,6 +18,7 @@ dependencies = [
   "rapidfuzz",
   "Jinja2",
   "pynput",
+  "openpyxl",
 ]
 
 [project.scripts]

@@ -84,6 +84,11 @@ class Message:
     occurred_at: str | None = None
     kind: str = "text"
     sequence: int = 0
+    original_text: str | None = None
+    occurred_date: str | None = None
+    date_source: str = "unresolved"
+    is_deleted: bool = False
+    edited_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,3 +120,4 @@ class CaptureSettings:
     stability_timeout: float = 3.0
     unchanged_limit: int = 3
     session_dir: Path = Path("data/captures")
+    direction: str = "up"
