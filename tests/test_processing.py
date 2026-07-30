@@ -1,3 +1,6 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from wechat_archive.models import Message, OCRLine
 from wechat_archive.processing import merge_capture_pages, overlap_length, parse_page
 
@@ -11,6 +14,7 @@ def message(text: str, speaker: str = "女朋友") -> Message:
 
 
 def test_parse_sides_and_visible_time() -> None:
+    reference = datetime(2026, 7, 30, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     messages = parse_page(
         [
             ocr("昨天 20:15", 0.42, 0.05),
@@ -18,9 +22,11 @@ def test_parse_sides_and_visible_time() -> None:
             ocr("刚到", 0.72, 0.30),
         ],
         "女朋友",
+        reference_time=reference,
     )
     assert [item.speaker for item in messages] == ["系统", "女朋友", "我"]
     assert messages[1].visible_time == "昨天 20:15"
+    assert messages[1].occurred_at == "2026-07-29T20:15+08:00"
 
 
 def test_overlap_uses_speaker_and_text() -> None:

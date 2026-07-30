@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal
@@ -119,7 +120,11 @@ class RegionDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("校准聊天区域")
-        self.canvas = RegionCanvas(QPixmap(str(image_path)), current)
+        image = QPixmap(str(image_path))
+        self.canvas = RegionCanvas(image, current)
+        self.region_size_label = QLabel()
+        self.region_size_label.setObjectName("status")
+        self.canvas.selection_changed.connect(self._update_region_size)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
             | QDialogButtonBox.StandardButton.Ok
@@ -128,11 +133,26 @@ class RegionDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.region_size_label)
         layout.addWidget(buttons)
+        self._update_region_size()
         self.resize(940, 660)
 
     def selected_region(self) -> NormalizedRegion:
         return self.canvas.selected_region()
+
+    def region_pixel_size(self) -> tuple[int, int]:
+        return self.selected_region().pixel_size(
+            self.canvas.image.width(), self.canvas.image.height()
+        )
+
+    def _update_region_size(self) -> None:
+        width, height = self.region_pixel_size()
+        low = round(height * 0.60)
+        high = round(height * 0.75)
+        self.region_size_label.setText(
+            f"区域尺寸：{width} x {height} px    建议每次向上滚动：{low}-{high} px"
+        )
 
 
 class MainWindow(QMainWindow):
@@ -146,6 +166,7 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.paused = False
         self.last_export: Path | None = None
+        self.calibrated_region_size: tuple[int, int] | None = None
         self._build_ui()
         self.refresh_windows()
         self.refresh_permissions()
@@ -191,13 +212,15 @@ class MainWindow(QMainWindow):
         self.partner_input = QLineEdit("女朋友")
         self.partner_input.setMaximumWidth(220)
         form.addRow("对方称呼", self.partner_input)
+        self.region_size_label = QLabel("尚未校准")
+        form.addRow("聊天区域", self.region_size_label)
         settings_row = QHBoxLayout()
         self.max_pages = QSpinBox()
         self.max_pages.setRange(1, 1000)
         self.max_pages.setValue(50)
         self.max_pages.setSuffix(" 页")
         self.scroll_pixels = QSpinBox()
-        self.scroll_pixels.setRange(150, 1400)
+        self.scroll_pixels.setRange(150, 3000)
         self.scroll_pixels.setValue(650)
         self.scroll_pixels.setSingleStep(50)
         self.scroll_pixels.setSuffix(" px")
@@ -249,8 +272,10 @@ class MainWindow(QMainWindow):
         self.preview.setMinimumWidth(340)
         self.preview.setObjectName("preview")
         splitter.addWidget(self.preview)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["序号", "发送方", "内容", "可见时间"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["序号", "发送方", "内容", "日期时间", "微信显示"]
+        )
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(2, self.table.horizontalHeader().ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
@@ -318,8 +343,17 @@ class MainWindow(QMainWindow):
                 dialog = RegionDialog(screenshot, self.region, self)
                 if dialog.exec() == QDialog.DialogCode.Accepted:
                     self.region = dialog.selected_region()
+                    self.calibrated_region_size = dialog.region_pixel_size()
+                    width, height = self.calibrated_region_size
+                    low = round(height * 0.60)
+                    high = round(height * 0.75)
+                    self.region_size_label.setText(
+                        f"{width} x {height} px（建议滚动 {low}-{high} px）"
+                    )
                     self._show_preview(screenshot)
-                    self.status_label.setText("聊天区域已校准")
+                    self.status_label.setText(
+                        f"聊天区域已校准：{width} x {height} px"
+                    )
         except RuntimeError as error:
             QMessageBox.critical(self, "校准失败", str(error))
 
@@ -402,6 +436,7 @@ class MainWindow(QMainWindow):
                 str(message.sequence),
                 message.speaker,
                 message.text,
+                _display_datetime(message.occurred_at),
                 message.visible_time or "",
             )
             for column, value in enumerate(values):
@@ -447,3 +482,12 @@ class MainWindow(QMainWindow):
 def configure_application(application: QApplication) -> None:
     application.setApplicationName("微信聊天归档")
     application.setOrganizationName("Local Archive")
+
+
+def _display_datetime(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value

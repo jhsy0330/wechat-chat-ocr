@@ -48,6 +48,10 @@ class NormalizedRegion:
         bottom = round(image.height * (self.y + self.height))
         return left, top, right, bottom
 
+    def pixel_size(self, image_width: int, image_height: int) -> tuple[int, int]:
+        self.validate()
+        return round(image_width * self.width), round(image_height * self.height)
+
     def screen_point(self, window: WindowInfo) -> tuple[float, float]:
         return (
             window.x + window.width * (self.x + self.width / 2),
@@ -77,6 +81,7 @@ class Message:
     width: float
     height: float
     visible_time: str | None = None
+    occurred_at: str | None = None
     kind: str = "text"
     sequence: int = 0
 

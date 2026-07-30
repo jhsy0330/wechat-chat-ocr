@@ -9,6 +9,7 @@ def test_region_pixel_box() -> None:
     image = Image.new("RGB", (1000, 800))
     region = NormalizedRegion(0.2, 0.1, 0.7, 0.8)
     assert region.pixel_box(image) == (200, 80, 900, 720)
+    assert region.pixel_size(image.width, image.height) == (700, 640)
 
 
 def test_region_screen_point() -> None:

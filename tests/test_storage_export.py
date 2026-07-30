@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from wechat_archive.exporter import export_archive
@@ -30,12 +31,15 @@ def test_incremental_storage_and_export(tmp_path: Path) -> None:
     assert added == 1
     assert [item.text for item in all_messages] == ["一", "二", "三"]
 
+    all_messages[0].occurred_at = "2026-07-30T20:00+08:00"
     html, markdown, data = export_archive(
         all_messages, "女朋友", tmp_path / "exports" / "chat"
     )
-    assert "女朋友" in html.read_text(encoding="utf-8")
-    assert "微信聊天记录" in markdown.read_text(encoding="utf-8")
-    assert len(json.loads(data.read_text(encoding="utf-8"))) == 3
+    assert "2026-07-30 20:00" in html.read_text(encoding="utf-8")
+    assert "2026-07-30 20:00" in markdown.read_text(encoding="utf-8")
+    exported = json.loads(data.read_text(encoding="utf-8"))
+    assert len(exported) == 3
+    assert exported[0]["occurred_at"] == "2026-07-30T20:00+08:00"
 
 
 def test_existing_image_ocr_can_be_hidden_without_deleting_database(
@@ -54,3 +58,47 @@ def test_existing_image_ocr_can_be_hidden_without_deleting_database(
     )
     assert [item.text for item in visible] == ["正常文字"]
     assert len(store.load_messages("女朋友")) == 2
+
+
+def test_existing_database_adds_occurred_at_column(tmp_path: Path) -> None:
+    database = tmp_path / "old.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE chats (
+                id INTEGER PRIMARY KEY,
+                partner_name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                session_dir TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                sequence INTEGER NOT NULL,
+                speaker TEXT NOT NULL,
+                text TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                source TEXT NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                width REAL NOT NULL,
+                height REAL NOT NULL,
+                visible_time TEXT,
+                kind TEXT NOT NULL,
+                UNIQUE(chat_id, sequence)
+            );
+            """
+        )
+    ArchiveStore(database)
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(messages)")
+        }
+    assert "occurred_at" in columns

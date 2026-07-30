@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
 from collections.abc import Callable
+from collections.abc import Sequence
+from datetime import datetime
 
 from rapidfuzz.fuzz import ratio
 
 from .models import Message, OCRLine
+from .time_parser import is_wechat_time_label, parse_wechat_timestamp
 
 
-TIME_PATTERN = re.compile(
-    r"^(?:(?:上午|下午|凌晨|晚上)\s*)?\d{1,2}:\d{2}$|"
-    r"(?:昨天|前天|星期[一二三四五六日天]|周[一二三四五六日天])|"
-    r"^\d{1,2}月\d{1,2}日|^\d{4}年\d{1,2}月\d{1,2}日"
-)
 SYSTEM_PATTERN = re.compile(r"以下为新消息|撤回了一条消息|你已添加了|以上是打招呼的内容")
 
 
@@ -25,7 +22,7 @@ def is_system_line(line: OCRLine) -> bool:
     text = line.text.strip()
     center = line.x + line.width / 2
     centered = abs(center - 0.5) <= 0.13
-    return bool(SYSTEM_PATTERN.search(text) or (centered and TIME_PATTERN.search(text)))
+    return bool(SYSTEM_PATTERN.search(text) or (centered and is_wechat_time_label(text)))
 
 
 def parse_page(
@@ -34,9 +31,12 @@ def parse_page(
     minimum_confidence: float = 0.25,
     text_filter: Callable[[OCRLine], bool] | None = None,
     system_filter: Callable[[OCRLine], bool] | None = None,
+    reference_time: datetime | None = None,
 ) -> list[Message]:
     messages: list[Message] = []
     visible_time: str | None = None
+    occurred_at: str | None = None
+    reference_time = reference_time or datetime.now().astimezone()
     for line in sorted(lines, key=lambda item: (item.y, item.x)):
         if line.confidence < minimum_confidence or not line.text.strip():
             continue
@@ -47,8 +47,10 @@ def parse_page(
             continue
         if system_line:
             speaker = "系统"
-            if TIME_PATTERN.search(line.text):
+            parsed_time = parse_wechat_timestamp(line.text, reference_time)
+            if parsed_time is not None:
                 visible_time = line.text.strip()
+                occurred_at = parsed_time.isoformat(timespec="minutes")
         else:
             center = line.x + line.width / 2
             speaker = "我" if center >= 0.5 else partner_name
@@ -63,6 +65,7 @@ def parse_page(
             width=line.width,
             height=line.height,
             visible_time=visible_time,
+            occurred_at=occurred_at,
             kind="system" if speaker == "系统" else "text",
         )
 
@@ -116,6 +119,14 @@ def merge_capture_pages(pages_newest_first: Sequence[Sequence[Message]]) -> list
     for page in reversed(pages_newest_first):
         overlap = overlap_length(merged, page, allow_short_single=True)
         merged.extend(page[overlap:])
+    current_visible_time: str | None = None
+    current_occurred_at: str | None = None
     for sequence, message in enumerate(merged, 1):
         message.sequence = sequence
+        if message.kind == "system" and message.occurred_at:
+            current_visible_time = message.visible_time
+            current_occurred_at = message.occurred_at
+        elif message.kind != "system" and current_occurred_at:
+            message.visible_time = current_visible_time
+            message.occurred_at = current_occurred_at
     return merged

@@ -30,6 +30,7 @@ class ArchiveWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
+            reference_time = datetime.now().astimezone()
             ocr = VisionOCR()
             self.status.emit("正在准备本地 OCR")
             ocr.ensure_helper()
@@ -51,6 +52,7 @@ class ArchiveWorker(QObject):
                         self.settings.partner_name,
                         text_filter=text_filter.accepts,
                         system_filter=text_filter.accepts_system,
+                        reference_time=reference_time,
                     )
                 )
             current_messages = merge_capture_pages(parsed_pages)

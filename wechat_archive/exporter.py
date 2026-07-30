@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from jinja2 import BaseLoader, Environment, select_autoescape
@@ -30,7 +31,7 @@ main{max-width:860px;margin:0 auto;padding:24px 18px 60px}
 <main>
 {% for message in messages %}
 <div class="row {% if message.speaker == '我' %}mine{% elif message.speaker == '系统' %}system{% else %}partner{% endif %}">
-  <div class="bubble">{{ message.text }}{% if message.visible_time and message.speaker != '系统' %}<span class="meta">{{ message.visible_time }}</span>{% endif %}</div>
+  <div class="bubble">{{ message.text }}{% if message.occurred_at and message.speaker != '系统' %}<span class="meta">{{ message.occurred_at|display_time }}{% if message.visible_time %} · 微信显示 {{ message.visible_time }}{% endif %}</span>{% endif %}</div>
 </div>
 {% endfor %}
 </main>
@@ -55,9 +56,12 @@ def export_archive(
     markdown_lines = [f"# 我和{partner_name}的微信聊天记录", ""]
     for message in messages:
         if message.speaker == "系统":
-            markdown_lines.append(f"> {message.text}")
+            normalized_time = _display_time(message.occurred_at)
+            suffix = f" -> {normalized_time}" if normalized_time else ""
+            markdown_lines.append(f"> {message.text}{suffix}")
         else:
-            time_text = f" · {message.visible_time}" if message.visible_time else ""
+            time_value = _display_time(message.occurred_at) or message.visible_time
+            time_text = f" · {time_value}" if time_value else ""
             markdown_lines.extend(
                 [f"**{message.speaker}{time_text}**", "", message.text, ""]
             )
@@ -66,6 +70,7 @@ def export_archive(
     environment = Environment(
         loader=BaseLoader(), autoescape=select_autoescape(default=True)
     )
+    environment.filters["display_time"] = _display_time
     html_path.write_text(
         environment.from_string(HTML_TEMPLATE).render(
             partner_name=partner_name, messages=messages
@@ -73,3 +78,12 @@ def export_archive(
         encoding="utf-8",
     )
     return html_path, markdown_path, json_path
+
+
+def _display_time(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value

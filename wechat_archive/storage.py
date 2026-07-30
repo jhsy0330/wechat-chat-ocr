@@ -9,6 +9,7 @@ from typing import Callable
 
 from .models import Message
 from .processing import overlap_length
+from .time_parser import parse_wechat_timestamp
 
 
 SCHEMA = """
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
     width REAL NOT NULL,
     height REAL NOT NULL,
     visible_time TEXT,
+    occurred_at TEXT,
     kind TEXT NOT NULL,
     UNIQUE(chat_id, sequence)
 );
@@ -53,6 +55,15 @@ class ArchiveStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(messages)")
+        }
+        if "occurred_at" not in columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN occurred_at TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
@@ -75,7 +86,8 @@ class ArchiveStore:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT m.* FROM messages m
+                SELECT m.*, s.started_at FROM messages m
+                JOIN sessions s ON s.id = m.session_id
                 JOIN chats c ON c.id = m.chat_id
                 WHERE c.partner_name = ? ORDER BY m.sequence
                 """,
@@ -95,7 +107,7 @@ class ArchiveStore:
             chat_id = self._chat_id(connection, partner_name)
             existing_rows = connection.execute(
                 """
-                SELECT m.*, s.session_dir FROM messages m
+                SELECT m.*, s.session_dir, s.started_at FROM messages m
                 JOIN sessions s ON s.id = m.session_id
                 WHERE m.chat_id = ? ORDER BY m.sequence
                 """,
@@ -137,8 +149,8 @@ class ArchiveStore:
                     """
                     INSERT INTO messages(
                         chat_id, session_id, sequence, speaker, text, confidence,
-                        source, x, y, width, height, visible_time, kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source, x, y, width, height, visible_time, occurred_at, kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chat_id,
@@ -153,6 +165,7 @@ class ArchiveStore:
                         message.width,
                         message.height,
                         message.visible_time,
+                        message.occurred_at,
                         message.kind,
                     ),
                 )
@@ -160,6 +173,14 @@ class ArchiveStore:
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:
+        occurred_at = row["occurred_at"]
+        if not occurred_at and row["visible_time"] and "started_at" in row.keys():
+            try:
+                reference = datetime.fromisoformat(str(row["started_at"]))
+            except ValueError:
+                reference = datetime.now().astimezone()
+            parsed = parse_wechat_timestamp(str(row["visible_time"]), reference)
+            occurred_at = parsed.isoformat(timespec="minutes") if parsed else None
         return Message(
             speaker=str(row["speaker"]),
             text=str(row["text"]),
@@ -170,6 +191,7 @@ class ArchiveStore:
             width=float(row["width"]),
             height=float(row["height"]),
             visible_time=row["visible_time"],
+            occurred_at=occurred_at,
             kind=str(row["kind"]),
             sequence=int(row["sequence"]),
         )
