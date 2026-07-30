@@ -1,0 +1,17 @@
+name: wechat-ocr
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - PySide6
+      - pyobjc-framework-Cocoa
+      - pyobjc-framework-Quartz
+      - pyobjc-framework-ApplicationServices
+      - Pillow
+      - numpy
+      - rapidfuzz
+      - Jinja2
+      - pynput
+      - pytest
