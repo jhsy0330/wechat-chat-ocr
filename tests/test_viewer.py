@@ -12,6 +12,7 @@ from wechat_archive.storage import ArchiveStore
 from wechat_archive.ui import MainWindow
 from wechat_archive.viewer import (
     ArchiveViewerPage,
+    DeleteChatDialog,
     EditMessageDialog,
     ExportDialog,
     ReviewQueuePage,
@@ -238,10 +239,16 @@ def test_contact_context_menu_exports_all_visible_records(
         page.message_table.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
     )
     calls: list[dict[str, object]] = []
+    deleted_contacts: list[str] = []
     monkeypatch.setattr(page, "_export_records", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(page, "_delete_chat", deleted_contacts.append)
 
     menu = page._build_chat_context_menu("联系人")
-    assert [action.text() for action in menu.actions()] == ["导出该联系人的全部聊天记录"]
+    assert [action.text() for action in menu.actions()] == [
+        "导出该联系人的全部聊天记录",
+        "",
+        "删除联系人",
+    ]
     menu.actions()[0].trigger()
     assert calls == [
         {
@@ -250,6 +257,29 @@ def test_contact_context_menu_exports_all_visible_records(
             "include_deleted": False,
         }
     ]
+    menu.actions()[2].trigger()
+    assert deleted_contacts == ["联系人"]
+
+
+def test_delete_chat_dialog_requires_exact_confirmation(tmp_path: Path) -> None:
+    application()
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    session = tmp_path / "captures" / "one"
+    session.mkdir(parents=True)
+    (session / "page.png").touch()
+    store.append_session(
+        "联系人",
+        [make_message("文字", "page.png", "2026-07-30T20:00+08:00")],
+        1,
+        session,
+    )
+    dialog = DeleteChatDialog(store.chat_deletion_preview("联系人"))
+
+    assert not dialog.delete_button.isEnabled()
+    dialog.confirmation_edit.setText(" 删除 ")
+    assert not dialog.delete_button.isEnabled()
+    dialog.confirmation_edit.setText("删除")
+    assert dialog.delete_button.isEnabled()
 
 
 def test_message_context_menu_has_current_and_multi_select_actions(

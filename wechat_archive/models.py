@@ -122,6 +122,14 @@ class ChatSummary:
 
 
 @dataclass(frozen=True)
+class ChatDeletionPreview:
+    partner_name: str
+    message_count: int
+    session_count: int
+    screenshot_file_count: int
+
+
+@dataclass(frozen=True)
 class ArchivedMessage:
     message_id: int
     partner_name: str

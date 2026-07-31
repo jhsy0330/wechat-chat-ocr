@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from .fingerprints import file_sha256, image_dhash, message_fingerprint
 from .models import (
@@ -15,6 +17,7 @@ from .models import (
     CapturePageInfo,
     CaptureSessionSummary,
     CaptureSettings,
+    ChatDeletionPreview,
     ChatSummary,
     Message,
     ReviewRecord,
@@ -379,6 +382,187 @@ class ArchiveStore:
                 summary.partner_name.casefold(),
             ),
         )
+
+    def chat_deletion_preview(self, partner_name: str) -> ChatDeletionPreview:
+        with closing(self._connect()) as connection:
+            preview, _session_dirs = self._chat_deletion_details(
+                connection, partner_name
+            )
+        return preview
+
+    def delete_chat(self, partner_name: str) -> ChatDeletionPreview:
+        captures_root = (self.path.parent / "captures").resolve()
+        staged_root = captures_root / f".deleting-{uuid4().hex}"
+        staged: list[tuple[Path, Path]] = []
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            preview, session_dirs = self._chat_deletion_details(
+                connection, partner_name
+            )
+            existing_dirs = [path for path in session_dirs if path.exists()]
+            if existing_dirs:
+                staged_root.mkdir(parents=False)
+                for index, source in enumerate(existing_dirs):
+                    target = staged_root / f"{index:04d}-{source.name}"
+                    source.rename(target)
+                    staged.append((source, target))
+
+            row = connection.execute(
+                "SELECT id FROM chats WHERE partner_name = ?", (partner_name,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("联系人不存在或已经被删除")
+            chat_id = int(row["id"])
+            connection.execute(
+                """
+                DELETE FROM message_reviews
+                WHERE message_id IN (SELECT id FROM messages WHERE chat_id = ?)
+                """,
+                (chat_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM message_revisions
+                WHERE message_id IN (SELECT id FROM messages WHERE chat_id = ?)
+                """,
+                (chat_id,),
+            )
+            connection.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+            connection.execute(
+                """
+                DELETE FROM capture_pages
+                WHERE session_id IN (SELECT id FROM sessions WHERE chat_id = ?)
+                """,
+                (chat_id,),
+            )
+            connection.execute(
+                "DELETE FROM capture_conflicts WHERE chat_id = ?", (chat_id,)
+            )
+            connection.execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
+            connection.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            for source, target in reversed(staged):
+                source.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target.rename(source)
+            if staged_root.exists():
+                staged_root.rmdir()
+            raise
+        finally:
+            connection.close()
+
+        if staged_root.exists():
+            shutil.rmtree(staged_root)
+        for source, _target in staged:
+            self._remove_empty_capture_parents(source.parent, captures_root)
+        return preview
+
+    def _chat_deletion_details(
+        self, connection: sqlite3.Connection, partner_name: str
+    ) -> tuple[ChatDeletionPreview, list[Path]]:
+        chat = connection.execute(
+            "SELECT id FROM chats WHERE partner_name = ?", (partner_name,)
+        ).fetchone()
+        if chat is None:
+            raise ValueError("联系人不存在或已经被删除")
+        chat_id = int(chat["id"])
+        active = connection.execute(
+            """
+            SELECT 1 FROM sessions
+            WHERE chat_id = ? AND status IN ('capturing', 'ocr') LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("该联系人正在采集或识别，请先停止任务再删除")
+
+        session_rows = connection.execute(
+            "SELECT id, session_dir FROM sessions WHERE chat_id = ? ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+        session_dirs = self._validated_chat_session_dirs(
+            connection, chat_id, [str(row["session_dir"]) for row in session_rows]
+        )
+        message_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)
+            ).fetchone()[0]
+        )
+        screenshot_file_count = sum(
+            sum(1 for child in path.rglob("*") if child.is_file() or child.is_symlink())
+            for path in session_dirs
+            if path.is_dir()
+        )
+        return (
+            ChatDeletionPreview(
+                partner_name=partner_name,
+                message_count=message_count,
+                session_count=len(session_rows),
+                screenshot_file_count=screenshot_file_count,
+            ),
+            session_dirs,
+        )
+
+    def _validated_chat_session_dirs(
+        self,
+        connection: sqlite3.Connection,
+        chat_id: int,
+        stored_paths: Sequence[str],
+    ) -> list[Path]:
+        captures_root = (self.path.parent / "captures").resolve()
+        candidates: list[Path] = []
+        for stored in stored_paths:
+            raw = self.resolve_session_dir(stored)
+            if raw.is_symlink():
+                raise ValueError(f"截图目录是符号链接，已拒绝删除：{raw}")
+            resolved = raw.resolve()
+            try:
+                resolved.relative_to(captures_root)
+            except ValueError as error:
+                raise ValueError(f"截图目录不在归档 captures 目录内：{resolved}") from error
+            if resolved == captures_root:
+                raise ValueError("截图会话目录不能是整个 captures 目录")
+            if resolved.exists() and not resolved.is_dir():
+                raise ValueError(f"截图会话路径不是目录：{resolved}")
+            candidates.append(resolved)
+
+        other_rows = connection.execute(
+            "SELECT session_dir FROM sessions WHERE chat_id != ?", (chat_id,)
+        ).fetchall()
+        other_dirs = [
+            self.resolve_session_dir(str(row["session_dir"])).resolve()
+            for row in other_rows
+        ]
+        for candidate in candidates:
+            if any(
+                candidate == other
+                or candidate in other.parents
+                or other in candidate.parents
+                for other in other_dirs
+            ):
+                raise ValueError(f"截图目录与其他联系人共用，已拒绝删除：{candidate}")
+
+        unique: list[Path] = []
+        for candidate in sorted(set(candidates), key=lambda path: len(path.parts)):
+            if not any(
+                parent == candidate or parent in candidate.parents for parent in unique
+            ):
+                unique.append(candidate)
+        return unique
+
+    @staticmethod
+    def _remove_empty_capture_parents(path: Path, captures_root: Path) -> None:
+        current = path
+        while current != captures_root:
+            try:
+                current.relative_to(captures_root)
+                current.rmdir()
+            except (OSError, ValueError):
+                return
+            current = current.parent
 
     def count_chat_messages(
         self,

@@ -677,6 +677,10 @@ class MainWindow(QMainWindow):
         self.capture_page.archive_changed.connect(self.viewer_page.refresh_archive)
         self.capture_page.archive_changed.connect(self.review_page.refresh)
         self.review_page.archive_changed.connect(self.viewer_page.refresh_archive)
+        self.viewer_page.archive_changed.connect(self.review_page.refresh)
+        self.viewer_page.archive_changed.connect(
+            self.capture_page.refresh_resumable_sessions
+        )
         self.review_page.archive_changed.connect(
             self.capture_page.refresh_resumable_sessions
         )

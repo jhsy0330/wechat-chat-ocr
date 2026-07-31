@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -49,12 +50,58 @@ from PySide6.QtWidgets import (
 )
 
 from .exporter import DEFAULT_EXPORT_FIELDS, EXPORT_FIELDS, export_records
-from .models import ArchivedMessage, ChatSummary, Message, ReviewRecord
+from .models import (
+    ArchivedMessage,
+    ChatDeletionPreview,
+    ChatSummary,
+    Message,
+    ReviewRecord,
+)
 from .storage import ArchiveStore
 from .visibility import ArchiveVisibilityScanner
 
 
 PAGE_SIZE = 200
+
+
+class DeleteChatDialog(QDialog):
+    def __init__(
+        self, preview: ChatDeletionPreview, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("永久删除联系人")
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+        warning = QLabel(
+            f"将永久删除联系人“{preview.partner_name}”以及：\n"
+            f"{preview.message_count} 条聊天记录、{preview.session_count} 个采集任务、"
+            f"{preview.screenshot_file_count} 个截图文件。"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        irreversible = QLabel("此操作不可恢复，不会删除已经导出的文件。")
+        irreversible.setWordWrap(True)
+        layout.addWidget(irreversible)
+        layout.addWidget(QLabel("请输入“删除”以确认："))
+        self.confirmation_edit = QLineEdit()
+        self.confirmation_edit.setPlaceholderText("删除")
+        layout.addWidget(self.confirmation_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.delete_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.delete_button.setText("永久删除")
+        self.delete_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        )
+        self.delete_button.setEnabled(False)
+        self.confirmation_edit.textChanged.connect(
+            lambda text: self.delete_button.setEnabled(text == "删除")
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class EditMessageDialog(QDialog):
@@ -447,6 +494,7 @@ class ScreenshotViewer(QWidget):
 
 class ArchiveViewerPage(QWidget):
     maintenance_changed = Signal(bool)
+    archive_changed = Signal()
 
     def __init__(self, database_path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -697,7 +745,40 @@ class ArchiveViewerPage(QWidget):
             )
         )
         menu.addAction(export_action)
+        menu.addSeparator()
+        delete_action = QAction("删除联系人", menu)
+        delete_action.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        )
+        delete_action.triggered.connect(
+            lambda _checked=False: self._delete_chat(partner_name)
+        )
+        menu.addAction(delete_action)
         return menu
+
+    def _delete_chat(self, partner_name: str) -> None:
+        try:
+            preview = self.store.chat_deletion_preview(partner_name)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "无法删除联系人", str(error))
+            return
+        dialog = DeleteChatDialog(preview, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            deleted = self.store.delete_chat(partner_name)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            QMessageBox.critical(self, "删除失败", str(error))
+            return
+        self.refresh_archive()
+        self.archive_changed.emit()
+        QMessageBox.information(
+            self,
+            "删除完成",
+            f"已永久删除“{deleted.partner_name}”及其 "
+            f"{deleted.message_count} 条聊天记录和 "
+            f"{deleted.screenshot_file_count} 个截图文件。",
+        )
 
     def _chat_selected(
         self, current: QListWidgetItem | None, _previous: QListWidgetItem | None

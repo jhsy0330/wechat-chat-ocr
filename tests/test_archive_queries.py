@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from wechat_archive.models import Message
 from wechat_archive.storage import ArchiveStore
 
@@ -177,3 +179,106 @@ def test_visible_message_query_supports_search_speaker_and_pagination(
     assert store.count_chat_messages("联系人", query="目标") == 2
     assert store.count_chat_messages("联系人", query="目标", speaker="我") == 2
     assert store.count_chat_messages("联系人", query="目标", speaker="联系人") == 0
+
+
+def test_delete_chat_removes_related_database_rows_and_capture_files(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "archive.sqlite3"
+    deleted_session = tmp_path / "captures" / "deleted"
+    kept_session = tmp_path / "captures" / "kept"
+    deleted_session.mkdir(parents=True)
+    kept_session.mkdir(parents=True)
+    (deleted_session / "page-001.png").touch()
+    (deleted_session / "page-ocr.json").touch()
+    (kept_session / "page-001.png").touch()
+    export = tmp_path / "exports" / "联系人.json"
+    export.parent.mkdir()
+    export.write_text("[]", encoding="utf-8")
+
+    store = ArchiveStore(database)
+    store.append_session(
+        "联系人",
+        [
+            message("第一条", source="page-001.png"),
+            message("第二条", source="page-001.png"),
+        ],
+        1,
+        deleted_session,
+    )
+    store.append_session(
+        "保留联系人", [message("保留", source="page-001.png")], 1, kept_session
+    )
+    record = store.load_chat_messages("联系人")[0]
+    store.update_message(
+        record.message_id,
+        text="已修改",
+        speaker=record.message.speaker,
+        occurred_date=None,
+        occurred_time=None,
+    )
+    store.set_review_status([record.message_id], "confirmed")
+    with sqlite3.connect(database) as connection:
+        chat_id, session_id = connection.execute(
+            """
+            SELECT c.id, s.id FROM chats c JOIN sessions s ON s.chat_id = c.id
+            WHERE c.partner_name = '联系人'
+            """
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO capture_pages(
+                session_id, page_number, source, sha256, perceptual_hash, created_at
+            ) VALUES (?, 1, 'page-001.png', 'sha', 'hash', '2026-07-31T00:00:00')
+            """,
+            (session_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO capture_conflicts(
+                chat_id, session_id, kind, details_json, status, created_at
+            ) VALUES (?, ?, 'missing_anchor', '{}', 'pending', '2026-07-31T00:00:00')
+            """,
+            (chat_id, session_id),
+        )
+
+    preview = store.chat_deletion_preview("联系人")
+    assert preview.message_count == 2
+    assert preview.session_count == 1
+    assert preview.screenshot_file_count == 2
+
+    deleted = store.delete_chat("联系人")
+
+    assert deleted == preview
+    assert not deleted_session.exists()
+    assert kept_session.is_dir()
+    assert export.is_file()
+    assert [chat.partner_name for chat in store.list_chats()] == ["保留联系人"]
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM message_revisions").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM message_reviews").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM capture_pages").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM capture_conflicts").fetchone()[0]
+            == 0
+        )
+    assert not list(tmp_path.glob("archive-pre-v*-*.sqlite3"))
+
+
+def test_delete_chat_rejects_session_directory_outside_captures(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "legacy-session"
+    outside.mkdir()
+    (outside / "page.png").touch()
+    store = ArchiveStore(tmp_path / "archive.sqlite3")
+    store.append_session("联系人", [message("文字")], 1, outside)
+
+    with pytest.raises(ValueError, match="不在归档 captures 目录内"):
+        store.delete_chat("联系人")
+
+    assert outside.is_dir()
+    assert store.list_chats()[0].partner_name == "联系人"
