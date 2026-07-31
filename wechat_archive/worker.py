@@ -109,6 +109,7 @@ class ArchiveWorker(QObject):
                         ),
                     )
                 text_filter = TextMessageFilter(page)
+                voice_bubbles = text_filter.detect_voice_bubbles(raw_lines)
                 parsed_pages.append(
                     parse_page(
                         raw_lines,
@@ -116,6 +117,7 @@ class ArchiveWorker(QObject):
                         text_filter=text_filter.accepts,
                         system_filter=text_filter.accepts_system,
                         reference_time=reference_time,
+                        voice_bubbles=voice_bubbles,
                     )
                 )
             current_messages = merge_capture_pages(
@@ -126,6 +128,8 @@ class ArchiveWorker(QObject):
             filter_cache: OrderedDict[Path, TextMessageFilter] = OrderedDict()
 
             def keep_existing(message: Message, source_path: Path) -> bool:
+                if message.kind == "voice":
+                    return True
                 if not source_path.exists():
                     return True
                 content_filter = filter_cache.get(source_path)

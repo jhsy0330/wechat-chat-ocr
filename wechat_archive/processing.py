@@ -7,7 +7,8 @@ from datetime import datetime
 
 from rapidfuzz.fuzz import ratio
 
-from .models import Message, OCRLine
+from .fingerprints import hash_distance, message_fingerprint
+from .models import DetectedVoiceBubble, Message, OCRLine
 from .time_parser import is_wechat_time_label, parse_wechat_timestamp
 
 
@@ -34,12 +35,46 @@ def parse_page(
     text_filter: Callable[[OCRLine], bool] | None = None,
     system_filter: Callable[[OCRLine], bool] | None = None,
     reference_time: datetime | None = None,
+    voice_bubbles: Sequence[DetectedVoiceBubble] = (),
 ) -> list[Message]:
     messages: list[Message] = []
     visible_time: str | None = None
     occurred_at: str | None = None
     reference_time = reference_time or datetime.now().astimezone()
-    for line in sorted(lines, key=lambda item: (item.y, item.x)):
+    suppressed_lines = {
+        line for bubble in voice_bubbles for line in bubble.suppressed_lines
+    }
+    events: list[tuple[float, float, OCRLine | DetectedVoiceBubble]] = [
+        (line.y, line.x, line) for line in lines if line not in suppressed_lines
+    ]
+    events.extend((bubble.y, bubble.x, bubble) for bubble in voice_bubbles)
+    for _y, _x, event in sorted(events, key=lambda item: (item[0], item[1])):
+        if isinstance(event, DetectedVoiceBubble):
+            center = event.x + event.width / 2
+            speaker = "我" if center >= 0.5 else partner_name
+            message = Message(
+                speaker=speaker,
+                text="[语音消息]",
+                confidence=event.confidence,
+                source=event.source,
+                x=event.x,
+                y=event.y,
+                width=event.width,
+                height=event.height,
+                visible_time=visible_time,
+                occurred_at=occurred_at,
+                occurred_date=occurred_at[:10] if occurred_at else None,
+                date_source="recognized" if occurred_at else "unresolved",
+                kind="voice",
+                original_text="[语音消息]",
+                voice_duration_seconds=event.duration_seconds,
+                voice_visual_hash=event.visual_hash,
+            )
+            message.fingerprint = message_fingerprint(message)
+            messages.append(message)
+            continue
+
+        line = event
         if line.confidence < minimum_confidence or not line.text.strip():
             continue
         system_line = is_system_line(line)
@@ -96,7 +131,12 @@ def parse_page(
 
 
 def _should_join(previous: Message, current: Message) -> bool:
-    if previous.speaker != current.speaker or current.speaker == "系统":
+    if (
+        previous.speaker != current.speaker
+        or current.speaker == "系统"
+        or previous.kind != "text"
+        or current.kind != "text"
+    ):
         return False
     vertical_gap = current.y - (previous.y + previous.height)
     same_anchor = abs(previous.x - current.x) <= 0.08
@@ -106,6 +146,25 @@ def _should_join(previous: Message, current: Message) -> bool:
 def message_similarity(left: Message, right: Message) -> float:
     if left.speaker != right.speaker:
         return 0.0
+    if left.kind != right.kind:
+        return 0.0
+    if left.kind == "voice":
+        if (
+            left.voice_duration_seconds is not None
+            and right.voice_duration_seconds is not None
+            and left.voice_duration_seconds != right.voice_duration_seconds
+        ):
+            return 0.0
+        if left.voice_visual_hash and right.voice_visual_hash:
+            distance = hash_distance(left.voice_visual_hash, right.voice_visual_hash)
+            if distance <= 6:
+                return 100.0
+            if distance <= 12:
+                return 94.0
+            return 0.0
+        return (
+            90.0 if left.voice_duration_seconds == right.voice_duration_seconds else 0.0
+        )
     return ratio(normalize_text(left.text), normalize_text(right.text))
 
 
@@ -122,6 +181,8 @@ def overlap_length(
             for a, b in zip(left[-size:], right[:size], strict=True)
         ]
         if all(score >= 88 for score in comparisons):
+            if size == 1 and right[0].kind == "voice":
+                continue
             text_size = sum(len(normalize_text(item.text)) for item in right[:size])
             if size >= 2 or text_size >= 4 or allow_short_single:
                 return size

@@ -19,6 +19,7 @@ EXPORT_FIELDS = {
     "original_text": "OCR 原始文字",
     "confidence": "置信度",
     "visible_time": "微信原始时间",
+    "voice_duration": "语音时长（秒）",
     "date_source": "日期来源",
     "screenshot_path": "截图路径",
     "coordinates": "OCR 坐标",
@@ -69,7 +70,9 @@ def export_archive(
     html_path = output_base.with_suffix(".html")
 
     json_path.write_text(
-        json.dumps([message.to_dict() for message in messages], ensure_ascii=False, indent=2),
+        json.dumps(
+            [message.to_dict() for message in messages], ensure_ascii=False, indent=2
+        ),
         encoding="utf-8",
     )
 
@@ -117,10 +120,7 @@ def export_records(
     if not formats or not fields:
         raise ValueError("至少选择一种格式和一个字段")
     output_base.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        _record_values(record, fields, archive_root)
-        for record in records
-    ]
+    rows = [_record_values(record, fields, archive_root) for record in records]
     labels = [EXPORT_FIELDS[field] for field in fields]
     outputs: dict[str, Path] = {}
 
@@ -135,9 +135,7 @@ def export_records(
         header = "| " + " | ".join(labels) + " |"
         separator = "| " + " | ".join("---" for _ in labels) + " |"
         body = [
-            "| "
-            + " | ".join(_markdown_cell(row[field]) for field in fields)
-            + " |"
+            "| " + " | ".join(_markdown_cell(row[field]) for field in fields) + " |"
             for row in rows
         ]
         path.write_text(
@@ -159,7 +157,9 @@ table{border-collapse:collapse;width:100%}th,td{border:1px solid #dfe2e5;padding
 <tbody>{% for row in rows %}<tr>{% for field in fields %}<td>{{ row[field] }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></body></html>"""
         )
         path.write_text(
-            template.render(partner=partner_name, labels=labels, fields=fields, rows=rows),
+            template.render(
+                partner=partner_name, labels=labels, fields=fields, rows=rows
+            ),
             encoding="utf-8",
         )
         outputs["html"] = path
@@ -187,10 +187,14 @@ def _record_values(
     occurred_time = ""
     if message.occurred_at:
         try:
-            occurred_time = datetime.fromisoformat(message.occurred_at).strftime("%H:%M")
+            occurred_time = datetime.fromisoformat(message.occurred_at).strftime(
+                "%H:%M"
+            )
         except ValueError:
             occurred_time = message.occurred_at
-    screenshot_path = os.path.relpath(record.source_path.resolve(), archive_root.resolve())
+    screenshot_path = os.path.relpath(
+        record.source_path.resolve(), archive_root.resolve()
+    )
     values: dict[str, object] = {
         "sequence": message.sequence,
         "date": message.occurred_date or "",
@@ -200,6 +204,7 @@ def _record_values(
         "original_text": message.original_text or message.text,
         "confidence": round(message.confidence, 4),
         "visible_time": message.visible_time or "",
+        "voice_duration": message.voice_duration_seconds or "",
         "date_source": message.date_source,
         "screenshot_path": screenshot_path,
         "coordinates": f"{message.x:.6f},{message.y:.6f},{message.width:.6f},{message.height:.6f}",

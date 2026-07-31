@@ -65,6 +65,7 @@ class EditMessageDialog(QDialog):
         layout = QFormLayout(self)
         self.text_edit = QTextEdit(message.text)
         self.text_edit.setMinimumHeight(120)
+        self.text_edit.setReadOnly(message.kind == "voice")
         layout.addRow("消息内容", self.text_edit)
         self.speaker_edit = QLineEdit(message.speaker)
         layout.addRow("发送人", self.speaker_edit)
@@ -162,6 +163,7 @@ class RevisionHistoryDialog(QDialog):
                 "date_source": self.record.message.date_source,
                 "is_deleted": self.record.message.is_deleted,
                 "edited_at": self.record.message.edited_at,
+                "voice_duration_seconds": (self.record.message.voice_duration_seconds),
             }
         )
         initial["text"] = self.record.message.original_text or initial.get("text", "")
@@ -193,8 +195,12 @@ class RevisionHistoryDialog(QDialog):
             f"日期：{snapshot.get('occurred_date') or ''}",
             f"时间：{snapshot.get('occurred_at') or ''}",
             f"日期来源：{snapshot.get('date_source') or ''}",
-            f"删除状态：{'已删除' if snapshot.get('is_deleted') else '正常'}",
         ]
+        if self.record.message.kind == "voice":
+            lines.append(
+                "语音时长：" + _voice_duration_text(snapshot.get("voice_duration_seconds"))
+            )
+        lines.append(f"删除状态：{'已删除' if snapshot.get('is_deleted') else '正常'}")
         self.detail.setPlainText("\n".join(lines))
 
     def _restore_version(self) -> None:
@@ -762,7 +768,7 @@ class ArchiveViewerPage(QWidget):
                 self.message_table.setItem(row, column, item)
         self.message_table.blockSignals(False)
 
-        self.message_count_label.setText(f"{self.total_messages} 条文字记录")
+        self.message_count_label.setText(f"{self.total_messages} 条聊天记录")
         self.export_button.setEnabled(self.total_messages > 0)
         self.page_label.setText(
             f"{self.current_page + 1} / {page_count}" if page_count else "0 / 0"
@@ -901,8 +907,15 @@ class ArchiveViewerPage(QWidget):
         message = record.message
         confidence = round(message.confidence * 100)
         state = "已定位并高亮" if available else "截图文件缺失"
+        confidence_kind = "检测" if message.kind == "voice" else "OCR"
+        duration = (
+            f" · {_voice_duration_text(message.voice_duration_seconds)}"
+            if message.kind == "voice"
+            else ""
+        )
         self.source_detail.setText(
-            f"{record.source_path.name} · OCR {confidence}% · {state}"
+            f"{record.source_path.name} · {confidence_kind} {confidence}%"
+            f"{duration} · {state}"
         )
         self.source_detail.setToolTip(str(record.source_path))
         self.open_source_button.setEnabled(available)
@@ -1170,6 +1183,8 @@ class ReviewQueuePage(QWidget):
         "suspected_duplicate": "疑似重复",
         "missing_screenshot": "截图缺失",
         "invalid_coordinates": "坐标异常",
+        "uncertain_voice": "语音识别存疑",
+        "missing_voice_duration": "语音时长缺失",
     }
 
     def __init__(self, database_path: Path, parent: QWidget | None = None) -> None:
@@ -1542,6 +1557,8 @@ def _display_message_datetime(message: Message) -> str:
 
 def _message_status(message: Message) -> str:
     states: list[str] = []
+    if message.kind == "voice":
+        states.append(_voice_duration_text(message.voice_duration_seconds))
     if message.is_deleted:
         states.append("已删除")
     if message.edited_at:
@@ -1553,6 +1570,12 @@ def _message_status(message: Message) -> str:
     elif message.date_source == "manual":
         states.append("日期手动")
     return " · ".join(states)
+
+
+def _voice_duration_text(value: object) -> str:
+    if value is None or value == "":
+        return "语音 · 时长未知"
+    return f"语音 · {int(value)} 秒"
 
 
 def _revision_action_label(action: str) -> str:

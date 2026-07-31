@@ -99,7 +99,7 @@ def test_schema_upgrade_creates_backup_before_migrating_content(
 
     migrated = ArchiveStore(database)
 
-    backups = list(tmp_path.glob("archive-pre-v4-*.sqlite3"))
+    backups = list(tmp_path.glob(f"archive-pre-v{SCHEMA_VERSION}-*.sqlite3"))
     assert migrated.last_backup_path in backups
     assert len(backups) == 1
     with sqlite3.connect(database) as connection:
@@ -111,7 +111,7 @@ def test_schema_upgrade_creates_backup_before_migrating_content(
 def test_new_empty_database_does_not_create_migration_backup(tmp_path: Path) -> None:
     ArchiveStore(tmp_path / "archive.sqlite3")
 
-    assert not list(tmp_path.glob("archive-pre-v4-*.sqlite3"))
+    assert not list(tmp_path.glob("archive-pre-v*-*.sqlite3"))
 
 
 def test_unique_middle_anchor_inserts_older_messages_before_existing(
@@ -371,6 +371,9 @@ def test_worker_resume_reuses_completed_page_ocr(tmp_path: Path, monkeypatch) ->
 
         def accepts_system(self, _line: OCRLine) -> bool:
             return True
+
+        def detect_voice_bubbles(self, _lines: list[OCRLine]):
+            return []
 
     monkeypatch.setattr("wechat_archive.worker.VisionOCR", FakeOCR)
     monkeypatch.setattr("wechat_archive.worker.TextMessageFilter", FakeFilter)

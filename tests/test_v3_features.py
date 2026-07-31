@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 from wechat_archive.exporter import export_records
 from wechat_archive.models import ArchivedMessage, Message
 from wechat_archive.processing import merge_capture_pages
-from wechat_archive.storage import ArchiveStore
+from wechat_archive.storage import ArchiveStore, SCHEMA_VERSION
 
 
 def message(
@@ -138,8 +138,14 @@ def test_legacy_schema_and_session_path_are_migrated(tmp_path: Path) -> None:
         revision_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'message_revisions'"
         ).fetchone()
+        message_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(messages)")
+        }
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert stored_session == "captures/legacy"
     assert revision_table is not None
+    assert {"voice_duration_seconds", "voice_visual_hash"} <= message_columns
+    assert schema_version == SCHEMA_VERSION
 
 
 def test_both_capture_orders_forward_fill_dates_without_inventing_time() -> None:

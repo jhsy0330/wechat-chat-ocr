@@ -70,6 +70,19 @@ class OCRLine:
     source: str
 
 
+@dataclass(frozen=True)
+class DetectedVoiceBubble:
+    source: str
+    x: float
+    y: float
+    width: float
+    height: float
+    duration_seconds: int | None
+    confidence: float
+    visual_hash: str
+    suppressed_lines: tuple[OCRLine, ...] = ()
+
+
 @dataclass
 class Message:
     speaker: str
@@ -92,6 +105,8 @@ class Message:
     fingerprint: str | None = None
     previous_fingerprint: str | None = None
     next_fingerprint: str | None = None
+    voice_duration_seconds: int | None = None
+    voice_visual_hash: str | None = None
     review_status: str = "pending"
     reviewed_at: str | None = None
 

@@ -23,7 +23,7 @@ from .processing import overlap_length
 from .time_parser import parse_wechat_timestamp
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS messages (
     fingerprint TEXT,
     previous_fingerprint TEXT,
     next_fingerprint TEXT,
+    voice_duration_seconds INTEGER,
+    voice_visual_hash TEXT,
     UNIQUE(chat_id, sequence)
 );
 CREATE TABLE IF NOT EXISTS message_revisions (
@@ -178,6 +180,8 @@ class ArchiveStore:
             "fingerprint": "TEXT",
             "previous_fingerprint": "TEXT",
             "next_fingerprint": "TEXT",
+            "voice_duration_seconds": "INTEGER",
+            "voice_visual_hash": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -709,6 +713,8 @@ class ArchiveStore:
                 raise ValueError("日期应为 YYYY-MM-DD，时间应为 HH:MM") from error
         with self._connect() as connection:
             before = self._message_snapshot(connection, message_id)
+            if before["kind"] == "voice":
+                text = "[语音消息]"
             edited_at = datetime.now().astimezone().isoformat(timespec="seconds")
             connection.execute(
                 """
@@ -788,7 +794,8 @@ class ArchiveStore:
         row = connection.execute(
             """
             SELECT text, speaker, occurred_date, occurred_at, date_source,
-                   is_deleted, edited_at, original_text
+                   is_deleted, edited_at, original_text, kind,
+                   voice_duration_seconds
             FROM messages WHERE id = ?
             """,
             (message_id,),
@@ -1124,8 +1131,9 @@ class ArchiveStore:
                     chat_id, session_id, sequence, speaker, text, confidence,
                     source, x, y, width, height, visible_time, occurred_at, kind,
                     is_visible, original_text, occurred_date, date_source,
-                    is_deleted, edited_at, fingerprint
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, NULL, ?)
+                    is_deleted, edited_at, fingerprint, voice_duration_seconds,
+                    voice_visual_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, NULL, ?, ?, ?)
                 """,
                 (
                     chat_id,
@@ -1146,6 +1154,8 @@ class ArchiveStore:
                     message.occurred_date,
                     message.date_source,
                     fingerprint,
+                    message.voice_duration_seconds,
+                    message.voice_visual_hash,
                 ),
             )
 
@@ -1281,6 +1291,10 @@ class ArchiveStore:
                 reasons.append("low_confidence")
             if message.kind != "system" and not message.occurred_date:
                 reasons.append("missing_date")
+            if message.kind == "voice" and message.confidence < 0.85:
+                reasons.append("uncertain_voice")
+            if message.kind == "voice" and message.voice_duration_seconds is None:
+                reasons.append("missing_voice_duration")
             center = message.x + message.width / 2
             if message.kind != "system" and abs(center - 0.5) <= 0.055:
                 reasons.append("uncertain_speaker")
@@ -1514,6 +1528,14 @@ class ArchiveStore:
             ),
             next_fingerprint=(
                 str(row["next_fingerprint"]) if row["next_fingerprint"] else None
+            ),
+            voice_duration_seconds=(
+                int(row["voice_duration_seconds"])
+                if row["voice_duration_seconds"] is not None
+                else None
+            ),
+            voice_visual_hash=(
+                str(row["voice_visual_hash"]) if row["voice_visual_hash"] else None
             ),
             review_status=(
                 str(row["review_status"])

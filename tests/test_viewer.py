@@ -12,11 +12,13 @@ from wechat_archive.storage import ArchiveStore
 from wechat_archive.ui import MainWindow
 from wechat_archive.viewer import (
     ArchiveViewerPage,
+    EditMessageDialog,
     ExportDialog,
     ReviewQueuePage,
     RevisionHistoryDialog,
     ScreenshotViewer,
     message_highlight_rect,
+    _message_status,
 )
 
 
@@ -44,6 +46,20 @@ def test_maps_normalized_ocr_box_to_painted_image() -> None:
     result = message_highlight_rect(message, QRectF(10, 20, 800, 600))
 
     assert result == QRectF(210, 140, 400, 60)
+
+
+def test_voice_message_text_is_read_only_and_status_shows_duration() -> None:
+    application()
+    message = make_message("[语音消息]", "voice.png", "2026-07-30T20:00+08:00")
+    message.kind = "voice"
+    message.voice_duration_seconds = 8
+    record = ArchivedMessage(1, "联系人", message, Path("voice.png"))
+
+    dialog = EditMessageDialog(record)
+
+    assert dialog.text_edit.isReadOnly()
+    assert dialog.text_edit.toPlainText() == "[语音消息]"
+    assert _message_status(message).startswith("语音 · 8 秒")
 
 
 def test_screenshot_viewer_loads_source_and_highlights_message(tmp_path: Path) -> None:
@@ -357,6 +373,7 @@ def test_revision_history_dialog_restores_selected_version(
     )
 
     assert dialog.table.rowCount() == 2
+    assert "语音时长" not in dialog.detail.toPlainText()
     dialog.table.setCurrentCell(0, 0)
     dialog._restore_version()
 

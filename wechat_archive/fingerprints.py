@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .models import Message
 
@@ -18,7 +18,12 @@ def file_sha256(path: Path) -> str:
 
 def image_dhash(path: Path) -> str:
     with Image.open(path) as image:
-        pixels = list(image.convert("L").resize((9, 8)).get_flattened_data())
+        return image_object_dhash(image)
+
+
+def image_object_dhash(image: Image.Image) -> str:
+    grayscale = ImageOps.grayscale(image).resize((9, 8))
+    pixels = list(grayscale.get_flattened_data())
     bits = 0
     for row in range(8):
         offset = row * 9
@@ -44,6 +49,16 @@ def normalized_message_text(message: Message) -> str:
 
 
 def message_fingerprint(message: Message) -> str:
+    if message.kind == "voice":
+        payload = "\x1f".join(
+            (
+                message.speaker.strip().casefold(),
+                message.kind,
+                str(message.voice_duration_seconds or ""),
+                message.voice_visual_hash or "",
+            )
+        )
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
     payload = "\x1f".join(
         (
             message.speaker.strip().casefold(),
